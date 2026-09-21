@@ -572,10 +572,18 @@ func getMultiBestPath(id string, pathList []*Path) []*Path {
 	}
 	best := pathList[0]
 
+	// RFC 9494: when the best path is fresh, LLGR_STALE paths must never be
+	// part of the multipath set. They sort behind fresh paths, so the search
+	// below would stop at the first one anyway; the explicit guard keeps the
+	// LLGR invariant visible here as well.
+	bestStale := best.IsLLGRStale()
+
 	// Attempt to find the first path that is both reachable and worse than the
 	// best path. Then return a slice paths from the best to that index.
 	index := sort.Search(len(pathList), func(i int) bool {
-		return pathList[i].IsNexthopInvalid || pathList[i].Compare(best) != 0
+		return pathList[i].IsNexthopInvalid ||
+			pathList[i].IsLLGRStale() != bestStale ||
+			pathList[i].Compare(best) != 0
 	})
 	return pathList[:index]
 }

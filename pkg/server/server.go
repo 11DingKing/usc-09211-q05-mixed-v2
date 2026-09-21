@@ -706,8 +706,14 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 	// Procedure section (Section 4.7).  Note that this requirement
 	// implies that such routes should be withdrawn from any such neighbor.
 	if path != nil && !path.IsWithdraw && !peer.isLLGREnabledFamily(path.GetFamily()) && path.IsLLGRStale() {
-		// we send unnecessary withdrawn even if we didn't
-		// sent the route.
+		// Only withdraw when this route was actually advertised to the peer
+		// (same destination and path-id). A stale path that never made it to
+		// RIB-out -- e.g. it lingers behind a fresh best path, it was
+		// send-max filtered, or the LLGR timer transition races an RIB-out
+		// reset -- must not produce a spurious withdrawal.
+		if !peer.hasPathAlreadyBeenSent(path) {
+			return nil
+		}
 		path = path.Clone(true)
 	}
 
@@ -1523,6 +1529,14 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 							toDelete := d.GetWithdrawnPath()
 							toActuallyDelete := make([]*table.Path, 0, len(toDelete))
 							for _, p := range toDelete {
+								// Withdraw only what this peer actually has in
+								// RIB-out. Marking a path LLGR_STALE may already
+								// have withdrawn it from a non-LLGR peer, and the
+								// later timer-expiry drop must not emit a second
+								// withdrawal for the same path.
+								if !targetPeer.hasPathAlreadyBeenSent(p) {
+									continue
+								}
 								// if the path is filtered, there is no need to send the withdrawal
 								p := s.filterpath(targetPeer, p, nil)
 								// the path was never advertized to the peer
@@ -1574,9 +1588,14 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						bestList = []*table.Path{}
 					} else if alreadySent || targetPeer.getRoutesCount(f, newPath.GetPrefix()) < targetPeer.getAddPathSendMax(f) {
 						bestList = []*table.Path{newPath}
-						if !alreadySent {
-							targetPeer.updateRoutes(newPath)
-						}
+						// Keep RIB-out bookkeeping in sync for both new
+						// advertisements and withdrawals: filterpath can turn
+						// an advertised update into a withdrawal (LLGR_STALE
+						// conversion toward a non-LLGR peer), in which case the
+						// later timer-expiry drop must not withdraw the same
+						// path twice. Storing an already-sent non-withdraw is a
+						// no-op.
+						targetPeer.updateRoutes(newPath)
 						if newPath.GetFamily() == bgp.RF_RTC_UC {
 							// we assumes that new "path" nlri was already sent before. This assumption avoids the
 							// infinite UPDATE loop between Route Reflector and its clients.
@@ -1614,7 +1633,18 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 				if !needOld {
 					oldList = nil
 				}
-				if paths := s.processOutgoingPaths(targetPeer, bestList, oldList); len(paths) > 0 {
+				paths := s.processOutgoingPaths(targetPeer, bestList, oldList)
+				if !targetPeer.isRouteServerClient() {
+					// Suppress withdrawals for routes this peer does not have
+					// in RIB-out. Marking a path LLGR_STALE already withdrew it
+					// from a non-LLGR peer (postFilterpath) and cleared its
+					// sent state; the LLGR restart-timer drop that follows
+					// must not withdraw the same prefix a second time.
+					paths = slices.DeleteFunc(paths, func(p *table.Path) bool {
+						return p.IsWithdraw && !targetPeer.hasPathAlreadyBeenSent(p)
+					})
+				}
+				if len(paths) > 0 {
 					targetPeer.updateRoutes(paths...)
 					sendfsmOutgoingMsg(targetPeer, paths)
 				}

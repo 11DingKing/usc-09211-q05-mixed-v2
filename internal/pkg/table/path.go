@@ -1258,6 +1258,18 @@ func (path *Path) MarshalJSON() ([]byte, error) {
 // Return 0 if they are equal
 // Return < 0 if rhs is preferred over the lhs
 func (lhs *Path) Compare(rhs *Path) int {
+	// LLGR_STALE paths are never equivalent to fresh paths for multipath
+	// purposes (RFC 9494, section 4.3): a fresh path must always win and a
+	// stale path can only be selected when every candidate is stale. Without
+	// this check, a stale path sorted behind a fresh best path would still be
+	// admitted into the multipath set.
+	if l := lhs.IsLLGRStale(); l != rhs.IsLLGRStale() {
+		if l {
+			return -1
+		}
+		return 1
+	}
+
 	if lhs.IsLocal() && !rhs.IsLocal() {
 		return 1
 	} else if !lhs.IsLocal() && rhs.IsLocal() {
