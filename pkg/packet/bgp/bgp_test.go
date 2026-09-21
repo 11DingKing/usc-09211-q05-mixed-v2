@@ -1,0 +1,7349 @@
+// Copyright (C) 2016 Nippon Telegraph and Telephone Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package bgp
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+	"net"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func keepalive() *BGPMessage {
+	return NewBGPKeepAliveMessage()
+}
+
+func notification() *BGPMessage {
+	return NewBGPNotificationMessage(1, 2, nil)
+}
+
+func refresh() *BGPMessage {
+	return NewBGPRouteRefreshMessage(1, 2, 10)
+}
+
+var result []string
+
+func PerfCaseNormalizeFlowSpecOpValues(b *testing.B) {
+	var r []string
+	for range b.N {
+		r = normalizeFlowSpecOpValues([]string{"&<=80"})
+	}
+	result = r
+}
+
+func Test_Message(t *testing.T) {
+	l := []*BGPMessage{keepalive(), notification(), refresh(), NewTestBGPOpenMessage(), NewTestBGPUpdateMessage()}
+
+	for _, m1 := range l {
+		buf1, err := m1.Serialize()
+		assert.NoError(t, err)
+
+		t.Log("LEN =", len(buf1))
+		m2, err := ParseBGPMessage(buf1)
+		assert.NoError(t, err)
+
+		// Compare the wire form, not the two structs. A decoded message
+		// keeps the length fields it read off the wire, and a message
+		// built in memory does not, so the structs never match.
+		buf2, err := m2.Serialize()
+		assert.NoError(t, err)
+		assert.Equal(t, buf1, buf2)
+	}
+}
+
+func Test_IPAddrPrefixString(t *testing.T) {
+	ipv4, _ := NewIPAddrPrefix(netip.MustParsePrefix("129.6.10.0/24"))
+	assert.Equal(t, "129.6.10.0/24", ipv4.String())
+	ipv4, _ = NewIPAddrPrefix(netip.MustParsePrefix("129.6.10.1/24"))
+	assert.Equal(t, "129.6.10.0/24", ipv4.String())
+	ipv4, _ = NewIPAddrPrefix(netip.MustParsePrefix("129.6.129.0/22"))
+	assert.Equal(t, "129.6.128.0/22", ipv4.String())
+
+	ipv6, _ := NewIPAddrPrefix(netip.MustParsePrefix("3343:faba:3903::0/64"))
+	assert.Equal(t, "3343:faba:3903::/64", ipv6.String())
+	ipv6, _ = NewIPAddrPrefix(netip.MustParsePrefix("3343:faba:3903::1/64"))
+	assert.Equal(t, "3343:faba:3903::/64", ipv6.String())
+	ipv6, _ = NewIPAddrPrefix(netip.MustParsePrefix("3343:faba:3903:129::0/63"))
+	assert.Equal(t, "3343:faba:3903:128::/63", ipv6.String())
+	mapped_ipv6, _ := NewIPAddrPrefix(netip.MustParsePrefix("::ffff:192.0.2.128/128"))
+	assert.Equal(t, "::ffff:192.0.2.128/128", mapped_ipv6.String())
+}
+
+func Test_ZeroIPv4Prefix(t *testing.T) {
+	buf := []byte{0}
+	nlri, err := NLRIFromSlice(RF_IPv4_UC, buf)
+	assert.NoError(t, err)
+	assert.Equal(t, "0.0.0.0/0", nlri.String())
+	ipv4 := nlri.(*IPAddrPrefix)
+	assert.Equal(t, ipv4.Prefix.Bits(), 0)
+	assert.Equal(t, ipv4.Prefix.Addr(), netip.IPv4Unspecified())
+
+	buf, err = nlri.Serialize()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0}, buf)
+}
+
+func TestStringLabelAddrPrefix(t *testing.T) {
+	assert := assert.New(t)
+
+	labels := NewMPLSLabelStack(100, 200)
+	v4, _ := NewLabeledIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24"), *labels)
+	assert.Equal("10.10.10.0/24", v4.String())
+	v6, _ := NewLabeledIPAddrPrefix(netip.MustParsePrefix("3343:faba:3903::/64"), *labels)
+	assert.Equal("3343:faba:3903::/64", v6.String())
+	mapped_ipv6, _ := NewLabeledIPAddrPrefix(netip.MustParsePrefix("::ffff:192.0.2.0/120"), *labels)
+	assert.Equal("::ffff:192.0.2.0/120", mapped_ipv6.String())
+
+	rd, _ := ParseRouteDistinguisher("300:100")
+	vpnv4, _ := NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24"), *labels, rd)
+	assert.Equal("300:100:10.10.10.0/24", vpnv4.String())
+	vpnv6, _ := NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("3343:faba:3903::/64"), *labels, rd)
+	assert.Equal("300:100:3343:faba:3903::/64", vpnv6.String())
+	vpnMappedIPv6, _ := NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("::ffff:192.0.2.0/120"), *labels, rd)
+	assert.Equal("300:100:::ffff:192.0.2.0/120", vpnMappedIPv6.String())
+}
+
+func Test_RouteTargetMembershipNLRIString(t *testing.T) {
+	assert := assert.New(t)
+
+	// TwoOctetAsSpecificExtended
+	buf := make([]byte, 13)
+	buf[0] = 96 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	binary.BigEndian.PutUint16(buf[7:9], 65000)
+	binary.BigEndian.PutUint32(buf[9:], 65546)
+	r := &RouteTargetMembershipNLRI{}
+	err := r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:65000:65546/96", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:65000:65546/96", r.String())
+
+	// TwoOctetAsSpecificExtended/64
+	buf = make([]byte, 9)
+	buf[0] = 64 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	binary.BigEndian.PutUint16(buf[7:], 65000)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:65000:0/64", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:65000:0/64", r.String())
+
+	// IPv4AddressSpecificExtended
+	buf = make([]byte, 13)
+	buf[0] = 96 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_IP4_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	ip := net.ParseIP("10.0.0.1").To4()
+	copy(buf[7:11], []byte(ip))
+	binary.BigEndian.PutUint16(buf[11:], 65000)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:10.0.0.1:65000/96", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:10.0.0.1:65000/96", r.String())
+
+	// IPv4AddressSpecificExtended/80
+	buf = make([]byte, 11)
+	buf[0] = 80 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_IP4_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	ip = net.ParseIP("10.0.0.1").To4()
+	copy(buf[7:11], []byte(ip))
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:10.0.0.1:0/80", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:10.0.0.1:0/80", r.String())
+
+	// FourOctetAsSpecificExtended
+	buf = make([]byte, 13)
+	buf[0] = 96 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_FOUR_OCTET_AS_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)                   // subtype
+	binary.BigEndian.PutUint32(buf[7:11], 65546)
+	binary.BigEndian.PutUint16(buf[11:], 65000)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1.10:65000/96", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1.10:65000/96", r.String())
+
+	// FourOctetAsSpecificExtended/80
+	buf = make([]byte, 11)
+	buf[0] = 80 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_FOUR_OCTET_AS_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)                   // subtype
+	binary.BigEndian.PutUint32(buf[7:], 65546)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1.10:0/80", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1.10:0/80", r.String())
+
+	// OpaqueExtended
+	buf = make([]byte, 13)
+	buf[0] = 96 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_OPAQUE) // typehigh
+	binary.BigEndian.PutUint32(buf[9:], 1000000)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1000000/96", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1000000/96", r.String())
+
+	// OpaqueExtended/40
+	buf = make([]byte, 6)
+	buf[0] = 40 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_OPAQUE) // typehigh
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:0/40", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:0/40", r.String())
+
+	// Unknown
+	buf = make([]byte, 13)
+	buf[0] = 96 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = 0x04 // typehigh
+	binary.BigEndian.PutUint32(buf[9:], 1000000)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1000000/96", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1000000/96", r.String())
+
+	// Unknown/41
+	buf = make([]byte, 7)
+	buf[0] = 41 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = 0xff // typehigh
+	buf[6] = 0xff
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:36028797018963968/41", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:36028797018963968/41", r.String())
+
+	// Default
+	buf = make([]byte, 1)
+	buf[0] = 0 // in bit length
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("0:0:0/0", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("0:0:0/0", r.String())
+	r = NewRouteTargetMembershipNLRI(0, nil)
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("0:0:0/0", r.String())
+
+	// AS only
+	buf = make([]byte, 5)
+	buf[0] = 32 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:0:0/32", r.String())
+	r = NewRouteTargetMembershipNLRI(65546, nil)
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:0:0/32", r.String())
+}
+
+// RFC 4684 Section 4 allows a prefix of 0 to 96 bits, and requires at least 32
+// bits for anything other than the zero-length default route target. Lengths
+// outside that make the NLRI syntactically incorrect (RFC 7606 Section 5.3), so
+// decoding must fail rather than accept a prefix that cannot be re-encoded.
+func Test_RouteTargetMembershipNLRILength(t *testing.T) {
+	assert := assert.New(t)
+	for _, tt := range []struct {
+		length uint8
+		valid  bool
+	}{
+		{0, true},
+		{1, false},
+		{16, false},
+		{31, false},
+		{32, true},
+		{64, true},
+		{95, true},
+		{96, true},
+		{97, false},
+		{104, false},
+		{200, false},
+		{255, false},
+	} {
+		// Always supply enough octets for the declared bit length so that only
+		// the length itself decides the outcome.
+		buf := make([]byte, 1+(int(tt.length)+7)/8)
+		buf[0] = tt.length
+		if len(buf) >= 13 {
+			binary.BigEndian.PutUint32(buf[1:5], 65546)
+			buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC)
+			buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+			binary.BigEndian.PutUint16(buf[7:9], 65000)
+			binary.BigEndian.PutUint32(buf[9:13], 100)
+		}
+		r := &RouteTargetMembershipNLRI{}
+		err := r.decodeFromBytes(buf)
+		if tt.valid {
+			assert.NoError(err, "length %d", tt.length)
+			continue
+		}
+		assert.Error(err, "length %d", tt.length)
+	}
+}
+
+func TestParseRouteTargetMembershipNLRI(t *testing.T) {
+	assert := assert.New(t)
+	cases := []struct {
+		in      string
+		wantStr string
+		wantAS  uint32
+		wantRT  bool
+		length  uint8
+	}{
+		{"0:0:0/0", "0:0:0/0", 0, false, 0},
+		{"0:0:0/32", "0:0:0/32", 0, false, 32},
+		{"0:0:0/96", "0:0:0/96", 0, true, 96},
+		{"65000:0:0/32", "65000:0:0/32", 65000, false, 32},
+		{"65000:65000:0/64", "65000:65000:0/64", 65000, true, 64},
+		{"65000:65000:100", "65000:65000:100/96", 65000, true, 96},
+		{"65000:65000:100/96", "65000:65000:100/96", 65000, true, 96},
+		{"65000:1.2.3.4:0/80", "65000:1.2.3.4:0/80", 65000, true, 80},
+		{"65000:1.2.3.4:100", "65000:1.2.3.4:100/96", 65000, true, 96},
+		{"65000:1.2.3.4:100/96", "65000:1.2.3.4:100/96", 65000, true, 96},
+		{"100.1000:65000:0/64", "6554600:65000:0/64", 100*65536 + 1000, true, 64},
+		{"100.1000:65000:100", "6554600:65000:100/96", 100*65536 + 1000, true, 96},
+		{"100.1000:65000:100/96", "6554600:65000:100/96", 100*65536 + 1000, true, 96},
+		{"100.1000:1.2.3.4:0/80", "6554600:1.2.3.4:0/80", 100*65536 + 1000, true, 80},
+		{"100.1000:1.2.3.4:100", "6554600:1.2.3.4:100/96", 100*65536 + 1000, true, 96},
+		{"100.1000:1.2.3.4:100/96", "6554600:1.2.3.4:100/96", 100*65536 + 1000, true, 96},
+	}
+	for _, c := range cases {
+		nlri, err := ParseRouteTargetMembershipNLRI(c.in)
+		assert.NoError(err, c.in)
+		assert.Equal(c.wantStr, nlri.String(), c.in)
+		assert.Equal(c.wantAS, nlri.AS, c.in)
+		assert.Equal(c.wantRT, nlri.RouteTarget != nil, c.in)
+		assert.Equal(c.length, nlri.Length, c.in)
+		buf, err := nlri.Serialize()
+		assert.NoError(err, c.in)
+		decoded := &RouteTargetMembershipNLRI{}
+		assert.NoError(decoded.decodeFromBytes(buf), c.in)
+		assert.Equal(c.wantStr, decoded.String(), c.in)
+	}
+	for _, in := range []string{
+		"",
+		"0:0:0/1",
+		"0:0:0/16",
+		"65000",
+		"65000:",
+		":65000:100",
+		"65000:65000:100/31",
+		"65000:65000:100/128",
+		"65000:65000:100/abc",
+		"65000:1.2.3.4:100/128",
+		"100.1000:65000:100/128",
+		"100.1000:1.2.3.4:100/128",
+	} {
+		_, err := ParseRouteTargetMembershipNLRI(in)
+		assert.Error(err, in)
+	}
+}
+
+func TestParseRTCPrefix(t *testing.T) {
+	assert := assert.New(t)
+	p1, err := ParseRTCPrefix("123:65000:100/96")
+	assert.NoError(err)
+	p2, err := ParseRTCPrefix("123:65000:100")
+	assert.NoError(err)
+	assert.Equal(p1, p2)
+	assert.Equal(96, p1.Bits())
+
+	// Masked() imitates PrefixCondition.Evaluate, which matches on r.Masked().Addr().
+	// A set key contains a path addr iff the path's covered bits match the key.
+	mk := func(s string) netip.Prefix {
+		p, err := ParseRTCPrefix(s)
+		assert.NoError(err)
+		return p.Masked()
+	}
+	p0 := mk("0:0:0/0")
+	p32 := mk("123:65000:0/32")
+	p64 := mk("123:65000:100/64")
+	p80 := mk("123:65000:100/80")
+	p96 := mk("123:65000:100/96")
+
+	assert.Equal(0, p0.Bits())
+	assert.Equal(32, p32.Bits())
+	assert.Equal(64, p64.Bits())
+	assert.Equal(80, p80.Bits())
+	assert.Equal(96, p96.Bits())
+
+	// /0 wildcard (RTC default-route) matches any RTC NLRI; "0:0:0/0" and "0:0/0" are equivalent.
+	assert.Equal(p0, mk("0:0/0"))
+	assert.True(p0.Contains(p32.Addr()))
+	assert.True(p0.Contains(p96.Addr()))
+	// /0 and /32 (AS-only ::/32) are distinct keys.
+	assert.NotEqual(p0, p32)
+
+	// /32 (origin-AS only) covers every path sharing that origin-AS, but not ::/0.
+	assert.True(p32.Contains(p64.Addr()))
+	assert.True(p32.Contains(p80.Addr()))
+	assert.True(p32.Contains(p96.Addr()))
+	assert.False(p32.Contains(p0.Addr()))
+	// A longer path addr does not contain the shorter /32 key.
+	assert.False(p64.Contains(p32.Addr()))
+
+	// /64 covers origin-AS + first 4 RT bytes (type, subtype, RT-AS). It covers the
+	// /80 and /96 paths (which extend it) but not the /32 key.
+	assert.True(p64.Contains(p80.Addr()))
+	assert.True(p64.Contains(p96.Addr()))
+	assert.False(p64.Contains(p32.Addr()))
+	// /80 covers origin-AS + 6 RT bytes; covers /96, not /32.
+	assert.True(p80.Contains(p96.Addr()))
+	assert.False(p80.Contains(p32.Addr()))
+	// /96 (full RT) covers only itself; it does not contain the masked shorter addrs,
+	// which have zeros in the host region where /96 has the RT value.
+	assert.False(p96.Contains(p64.Addr()))
+	assert.False(p96.Contains(p80.Addr()))
+	assert.False(p96.Contains(p32.Addr()))
+
+	// The TwoOctetAsSpecific value (100/200) lives in the low RT bytes, outside /64,
+	// so the two /64 keys collapse to the same masked trie key.
+	assert.Equal(p64, mk("123:65000:200/64"))
+
+	// IPv4 RT: /80 covers origin-AS + the 4-byte IPv4 address but not the 2-byte value.
+	p80ip := mk("123:1.2.3.4:100/80")
+	p96ip := mk("123:1.2.3.4:100/96")
+	assert.Equal(80, p80ip.Bits())
+	assert.True(p80ip.Contains(p96ip.Addr()))
+	assert.False(p96ip.Contains(p80ip.Addr()))
+}
+
+func TestRouteTargetKey(t *testing.T) {
+	assert := assert.New(t)
+
+	// TwoOctetAsSpecificExtended
+	buf := make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC)
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	binary.BigEndian.PutUint16(buf[7:9], 0x1314)
+	binary.BigEndian.PutUint32(buf[9:], 0x15161718)
+	r, err := NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	key, err := r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0x0002131415161718), key)
+
+	// IPv4AddressSpecificExtended
+	buf = make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_IP4_SPECIFIC)
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	ip := net.ParseIP("10.1.2.3").To4()
+	copy(buf[7:11], []byte(ip))
+	binary.BigEndian.PutUint16(buf[11:], 0x1314)
+	r, err = NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	key, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0x01020a0102031314), key)
+
+	// FourOctetAsSpecificExtended
+	buf = make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_FOUR_OCTET_AS_SPECIFIC)
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	binary.BigEndian.PutUint32(buf[7:], 0x15161718)
+	binary.BigEndian.PutUint16(buf[11:], 0x1314)
+	r, err = NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	key, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0x0202151617181314), key)
+
+	// non-Route Target
+	buf = make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_OPAQUE)
+	binary.BigEndian.PutUint32(buf[9:], 1000000)
+	r, err = NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	_, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NotNil(err)
+
+	// default NLRI
+	r = &RouteTargetMembershipNLRI{}
+	key, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0), key)
+
+	_, err = ExtCommRouteTargetKey(nil)
+	assert.Equal(ErrNilCommunity, err)
+}
+
+func TestParseAs4Value(t *testing.T) {
+	assert := assert.New(t)
+	cases := []struct {
+		in  string
+		out uint32
+	}{
+		// asplain
+		{"0", 0},
+		{"65000", 65000},
+		{"4294967295", 4294967295},
+		// asdot (high.low)
+		{"0.0", 0},
+		{"1.0", 1 << 16},
+		{"1.1000", 1<<16 | 1000},
+		{"65535.65535", 4294967295},
+		{"100.1000", 100*65536 + 1000},
+	}
+	for _, c := range cases {
+		v, err := ParseAs4Value(c.in)
+		assert.NoError(err, c.in)
+		assert.Equal(c.out, v, c.in)
+	}
+	for _, in := range []string{"", "abc", "1.2.3", ".1", "1.", "65536.1", "1.65536", "4294967296"} {
+		_, err := ParseAs4Value(in)
+		assert.Error(err, in)
+	}
+}
+
+func Test_MalformedUpdateMsg(t *testing.T) {
+	assert := assert.New(t)
+	var bufin []byte
+	var u *BGPUpdate
+	var err error
+
+	// Invalid AS_PATH
+	bufin = []byte{
+		0x00, 0x00, // Withdraws(0)
+		0x00, 0x16, // Attrs Len(22)
+		0x40, 0x01, 0x01, 0x00, // Attr(ORIGIN)
+		0x40, 0x03, 0x04, 0xc0, // Attr(NEXT_HOP)
+		0xa8, 0x01, 0x64,
+		0x40, 0x02, 0x17, // Attr(AS_PATH) - invalid length
+		0x02, 0x03, 0xfd, 0xe8,
+		0xfd, 0xe8, 0xfd, 0xe8,
+		0x08, 0x0a, // NLRI
+	}
+
+	u = &BGPUpdate{}
+	err = u.DecodeFromBytes(bufin)
+	assert.Error(err)
+	assert.Equal(ERROR_HANDLING_TREAT_AS_WITHDRAW, err.(*MessageError).ErrorHandling)
+
+	// Invalid AGGREGATOR
+	bufin = []byte{
+		0x00, 0x00, // Withdraws(0)
+		0x00, 0x16, // Attrs Len(22)
+		0xc0, 0x07, 0x05, // Flag, Type(7), Length(5)
+		0x00, 0x00, 0x00, 0x64, // aggregator - invalid length
+		0x00,
+		0x40, 0x01, 0x01, 0x00, // Attr(ORIGIN)
+		0x40, 0x03, 0x04, 0xc0, // Attr(NEXT_HOP)
+		0xa8, 0x01, 0x64,
+		0x40, 0x02, 0x00, // Attr(AS_PATH)
+	}
+
+	u = &BGPUpdate{}
+	err = u.DecodeFromBytes(bufin)
+	assert.Error(err)
+	assert.Equal(ERROR_HANDLING_ATTRIBUTE_DISCARD, err.(*MessageError).ErrorHandling)
+
+	// Invalid MP_REACH_NLRI
+	bufin = []byte{
+		0x00, 0x00, // Withdraws(0)
+		0x00, 0x27, // Attrs Len(39)
+		0x80, 0x0e, 0x1d, // Flag, Type(14), Length(29)
+		0x00, 0x02, 0x01, // afi(2), safi(1)
+		0x0f, 0x00, 0x00, 0x00, // nexthop - invalid nexthop length
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0xff,
+		0xff, 0x0a, 0x00, 0x00,
+		0x00,                   // SNPA(0)
+		0x40, 0x20, 0x01, 0x0d, // NLRI
+		0xb8, 0x00, 0x01, 0x00,
+		0x00,
+		0x40, 0x01, 0x01, 0x00, // Attr(ORIGIN)
+		0x40, 0x02, 0x00, // Attr(AS_PATH)
+	}
+
+	err = u.DecodeFromBytes(bufin)
+	assert.Error(err)
+	assert.Equal(ERROR_HANDLING_AFISAFI_DISABLE, err.(*MessageError).ErrorHandling)
+
+	// Invalid flag
+	bufin = []byte{
+		0x00, 0x00, // Withdraws(0)
+		0x00, 0x0e, // Attrs Len(14)
+		0xc0, 0x01, 0x01, 0x00, // Attr(ORIGIN) - invalid flag
+		0x40, 0x03, 0x04, 0xc0, // Attr(NEXT_HOP)
+		0xa8, 0x01, 0x64,
+		0x40, 0x02, 0x00, // Attr(AS_PATH)
+	}
+
+	err = u.DecodeFromBytes(bufin)
+	assert.Error(err)
+	assert.Equal(ERROR_HANDLING_TREAT_AS_WITHDRAW, err.(*MessageError).ErrorHandling)
+
+	// Invalid AGGREGATOR and MULTI_EXIT_DESC
+	bufin = []byte{
+		0x00, 0x00, // Withdraws(0)
+		0x00, 0x1e, // Attrs Len(30)
+		0xc0, 0x07, 0x05, 0x00, // Attr(AGGREGATOR) - invalid length
+		0x00, 0x00, 0x64, 0x00,
+		0x80, 0x04, 0x05, 0x00, // Attr(MULTI_EXIT_DESC)  - invalid length
+		0x00, 0x00, 0x00, 0x64,
+		0x40, 0x01, 0x01, 0x00, // Attr(ORIGIN)
+		0x40, 0x02, 0x00, // Attr(AS_PATH)
+		0x40, 0x03, 0x04, 0xc0, // Attr(NEXT_HOP)
+		0xa8, 0x01, 0x64,
+		0x20, 0xc8, 0xc8, 0xc8, // NLRI
+		0xc8,
+	}
+
+	err = u.DecodeFromBytes(bufin)
+	assert.Error(err)
+	assert.Equal(ERROR_HANDLING_TREAT_AS_WITHDRAW, err.(*MessageError).ErrorHandling)
+}
+
+func Test_RFC5512(t *testing.T) {
+	assert := assert.New(t)
+
+	buf := make([]byte, 8)
+	buf[0] = byte(EC_TYPE_TRANSITIVE_OPAQUE)
+	buf[1] = byte(EC_SUBTYPE_COLOR)
+	binary.BigEndian.PutUint32(buf[4:], 1000000)
+	ec, err := ParseExtended(buf)
+	assert.NoError(err)
+	assert.Equal("1000000", ec.String())
+	buf, err = ec.Serialize()
+	assert.NoError(err)
+	assert.Equal([]byte{0x3, 0xb, 0x0, 0x0, 0x0, 0xf, 0x42, 0x40}, buf)
+
+	buf = make([]byte, 8)
+	buf[0] = byte(EC_TYPE_TRANSITIVE_OPAQUE)
+	buf[1] = byte(EC_SUBTYPE_ENCAPSULATION)
+	binary.BigEndian.PutUint16(buf[6:], uint16(TUNNEL_TYPE_VXLAN))
+	ec, err = ParseExtended(buf)
+	assert.NoError(err)
+	assert.Equal("VXLAN", ec.String())
+	buf, err = ec.Serialize()
+	assert.NoError(err)
+	assert.Equal([]byte{0x3, 0xc, 0x0, 0x0, 0x0, 0x0, 0x0, 0x8}, buf)
+
+	tlv := NewTunnelEncapTLV(TUNNEL_TYPE_VXLAN, []TunnelEncapSubTLVInterface{NewTunnelEncapSubTLVColor(10)})
+	attr := NewPathAttributeTunnelEncap([]*TunnelEncapTLV{tlv})
+
+	buf1, err := attr.Serialize()
+	assert.NoError(err)
+
+	p, err := GetPathAttribute(buf1)
+	assert.NoError(err)
+
+	err = p.DecodeFromBytes(buf1)
+	assert.NoError(err)
+
+	buf2, err := p.Serialize()
+	assert.NoError(err)
+	assert.Equal(buf1, buf2)
+
+	n1, _ := NewEncapNLRI(netip.MustParseAddr("10.0.0.1"))
+	buf1, err = n1.Serialize()
+	assert.NoError(err)
+
+	n2, err := NLRIFromSlice(RF_IPv4_ENCAP, buf1)
+	assert.NoError(err)
+	assert.Equal("10.0.0.1", n2.String())
+
+	n3, _ := NewEncapNLRI(netip.MustParseAddr("2001::1"))
+	buf1, err = n3.Serialize()
+	assert.NoError(err)
+
+	n4, err := NLRIFromSlice(RF_IPv6_ENCAP, buf1)
+	assert.NoError(err)
+	assert.Equal("2001::1", n4.String())
+}
+
+func Test_ASLen(t *testing.T) {
+	assert := assert.New(t)
+
+	aspath := AsPathParam{
+		Num: 2,
+		AS:  []uint16{65000, 65001},
+	}
+	aspath.Type = BGP_ASPATH_ATTR_TYPE_SEQ
+	assert.Equal(2, aspath.ASLen())
+
+	aspath.Type = BGP_ASPATH_ATTR_TYPE_SET
+	assert.Equal(1, aspath.ASLen())
+
+	aspath.Type = BGP_ASPATH_ATTR_TYPE_CONFED_SEQ
+	assert.Equal(0, aspath.ASLen())
+
+	aspath.Type = BGP_ASPATH_ATTR_TYPE_CONFED_SET
+	assert.Equal(0, aspath.ASLen())
+
+	as4path := As4PathParam{
+		Num: 2,
+		AS:  []uint32{65000, 65001},
+	}
+	as4path.Type = BGP_ASPATH_ATTR_TYPE_SEQ
+	assert.Equal(2, as4path.ASLen())
+
+	as4path.Type = BGP_ASPATH_ATTR_TYPE_SET
+	assert.Equal(1, as4path.ASLen())
+
+	as4path.Type = BGP_ASPATH_ATTR_TYPE_CONFED_SEQ
+	assert.Equal(0, as4path.ASLen())
+
+	as4path.Type = BGP_ASPATH_ATTR_TYPE_CONFED_SET
+	assert.Equal(0, as4path.ASLen())
+}
+
+func Test_MPLSLabelStack(t *testing.T) {
+	assert := assert.New(t)
+	mpls := NewMPLSLabelStack()
+	buf, err := mpls.Serialize()
+	assert.NoError(err)
+	assert.Equal(true, bytes.Equal(buf, []byte{0, 0, 1}))
+
+	mpls = &MPLSLabelStack{}
+	assert.Nil(mpls.DecodeFromBytes(buf))
+	assert.Equal(1, len(mpls.Labels))
+	assert.Equal(uint32(0), mpls.Labels[0])
+
+	mpls = NewMPLSLabelStack(WITHDRAW_LABEL)
+	buf, err = mpls.Serialize()
+	assert.NoError(err)
+	assert.Equal(true, bytes.Equal(buf, []byte{128, 0, 0}))
+
+	mpls = &MPLSLabelStack{}
+	assert.Nil(mpls.DecodeFromBytes(buf))
+	assert.Equal(1, len(mpls.Labels))
+	assert.Equal(WITHDRAW_LABEL, mpls.Labels[0])
+}
+
+func TestMPLSLabelStackMissingBOS(t *testing.T) {
+	// Three-byte label with bottom-of-stack bit clear (label 100, S=0).
+	noBOS := []byte{0x00, 0x06, 0x40} // label=100, TC=0, S=0
+
+	t.Run("DecodeFromBytes_rejects_missing_BOS", func(t *testing.T) {
+		s := &MPLSLabelStack{}
+		err := s.DecodeFromBytes(noBOS)
+		require.Error(t, err, "label stack without BOS bit must be rejected")
+	})
+
+	t.Run("Serialize_empty_returns_error_not_panic", func(t *testing.T) {
+		s := &MPLSLabelStack{Labels: []uint32{}}
+		_, err := s.Serialize()
+		require.Error(t, err, "serializing empty label stack must return error")
+	})
+
+	t.Run("LabeledIPAddrPrefix_rejects_missing_BOS", func(t *testing.T) {
+		// bits=27 (3-byte label + 3-bit prefix), then label without BOS, then prefix byte.
+		// bits field: label(3B)=24 bits + prefix bits=3 -> 27
+		data := []byte{27, 0x00, 0x06, 0x40, 0xa0} // bits=27, label noBOS, prefix
+		n := &LabeledIPAddrPrefix{}
+		err := n.decodeFromBytes(data, 4)
+		require.Error(t, err)
+	})
+
+	t.Run("LabeledVPNIPAddrPrefix_rejects_bits_too_short", func(t *testing.T) {
+		// Construct a VPN NLRI where bits < 8*labelLen to trigger the
+		// "declared length too short for label stack" path.
+		// Valid label with BOS: label=100, S=1 -> [0x00, 0x06, 0x41]
+		// bits=1 (way too small for a 3-byte label stack + 8-byte RD + prefix)
+		validLabel := []byte{0x00, 0x06, 0x41}   // label=100, BOS=1
+		data := append([]byte{1}, validLabel...) // bits=1
+		n := &LabeledVPNIPAddrPrefix{}
+		err := n.decodeFromBytes(data, 4)
+		require.Error(t, err)
+	})
+}
+
+func Test_FlowSpecNlri(t *testing.T) {
+	assert := assert.New(t)
+	cmp := make([]FlowSpecComponentInterface, 0)
+	destPrefix, _ := NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	cmp = append(cmp, NewFlowSpecDestinationPrefix(destPrefix))
+	srcPrefix, _ := NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	cmp = append(cmp, NewFlowSpecSourcePrefix(srcPrefix))
+	item1 := NewFlowSpecComponentItem(DEC_NUM_OP_EQ, TCP)
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_IP_PROTO, []*FlowSpecComponentItem{item1}))
+	item2 := NewFlowSpecComponentItem(DEC_NUM_OP_GT_EQ, 20)
+	item3 := NewFlowSpecComponentItem(DEC_NUM_OP_AND|DEC_NUM_OP_LT_EQ, 30)
+	item4 := NewFlowSpecComponentItem(DEC_NUM_OP_GT_EQ, 10)
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_PORT, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_DST_PORT, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_SRC_PORT, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_ICMP_TYPE, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_ICMP_CODE, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_PKT_LEN, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_DSCP, []*FlowSpecComponentItem{item2, item3, item4}))
+	isFragment := uint64(0x02)
+	lastFragment := uint64(0x08)
+	item5 := NewFlowSpecComponentItem(BITMASK_FLAG_OP_MATCH, isFragment)
+	item6 := NewFlowSpecComponentItem(BITMASK_FLAG_OP_AND, lastFragment)
+
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_FRAGMENT, []*FlowSpecComponentItem{item5, item6}))
+	item7 := NewFlowSpecComponentItem(0, TCP_FLAG_ACK)
+	item8 := NewFlowSpecComponentItem(BITMASK_FLAG_OP_AND|BITMASK_FLAG_OP_NOT, TCP_FLAG_URGENT)
+
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_TCP_FLAG, []*FlowSpecComponentItem{item7, item8}))
+	n1, _ := NewFlowSpecUnicast(RF_FS_IPv4_UC, cmp)
+
+	buf1, err := n1.Serialize()
+	assert.NoError(err)
+
+	n2, err := NLRIFromSlice(RF_FS_IPv4_UC, buf1)
+	assert.NoError(err)
+	// should be equal
+	assert.Equal(n1, n2)
+}
+
+func Test_FlowSpecNlriComponentsClampedToDeclaredLength(t *testing.T) {
+	assert := assert.New(t)
+	item := NewFlowSpecComponentItem(DEC_NUM_OP_EQ, 6)
+	comp := NewFlowSpecComponent(FLOW_SPEC_TYPE_IP_PROTO, []*FlowSpecComponentItem{item})
+	n1, err := NewFlowSpecUnicast(RF_FS_IPv4_UC, []FlowSpecComponentInterface{comp})
+	assert.NoError(err)
+	one, err := n1.Serialize()
+	assert.NoError(err)
+	declared := int(one[0])
+
+	// Declare one byte fewer than the component occupies, then append a byte
+	// that belongs to the next NLRI. The component must not reach past the
+	// declared length into that following byte.
+	buf := make([]byte, len(one))
+	copy(buf, one)
+	buf[0] = byte(declared - 1)
+	buf = append(buf, 0xEE)
+
+	nlri, err := NLRIFromSlice(RF_FS_IPv4_UC, buf)
+	assert.NoError(err)
+	assert.LessOrEqual(nlri.Len(), 1+(declared-1))
+}
+
+func Test_NewFlowSpecComponentItemLength(t *testing.T) {
+	item := NewFlowSpecComponentItem(0, 0)
+	assert.Equal(t, 1, item.Len())
+	item = NewFlowSpecComponentItem(0, math.MaxUint8)
+	assert.Equal(t, 1, item.Len())
+
+	item = NewFlowSpecComponentItem(0, math.MaxUint8+1)
+	assert.Equal(t, 2, item.Len())
+	item = NewFlowSpecComponentItem(0, math.MaxUint16)
+	assert.Equal(t, 2, item.Len())
+
+	item = NewFlowSpecComponentItem(0, math.MaxUint16+1)
+	assert.Equal(t, 4, item.Len())
+	item = NewFlowSpecComponentItem(0, math.MaxUint32)
+	assert.Equal(t, 4, item.Len())
+
+	item = NewFlowSpecComponentItem(0, math.MaxUint32+1)
+	assert.Equal(t, 8, item.Len())
+	item = NewFlowSpecComponentItem(0, math.MaxUint64)
+	assert.Equal(t, 8, item.Len())
+}
+
+func Test_LinkBandwidthExtended(t *testing.T) {
+	assert := assert.New(t)
+	exts := make([]ExtendedCommunityInterface, 0)
+	exts = append(exts, NewLinkBandwidthExtended(65001, 125000.0))
+	m1 := NewPathAttributeExtendedCommunities(exts)
+	buf1, err := m1.Serialize()
+	require.NoError(t, err)
+
+	m2 := NewPathAttributeExtendedCommunities(nil)
+	err = m2.DecodeFromBytes(buf1)
+	require.NoError(t, err)
+
+	_, err = m2.Serialize()
+	require.NoError(t, err)
+
+	assert.Equal(m1, m2)
+}
+
+func Test_FlowSpecExtended(t *testing.T) {
+	assert := assert.New(t)
+	exts := make([]ExtendedCommunityInterface, 0)
+	exts = append(exts, NewTrafficRateExtended(100, 9600.0))
+	exts = append(exts, NewTrafficActionExtended(true, false))
+	exts = append(exts, NewRedirectTwoOctetAsSpecificExtended(1000, 1000))
+	ex, _ := NewRedirectIPv4AddressSpecificExtended(netip.MustParseAddr("10.0.0.1"), 1000)
+	exts = append(exts, ex)
+	exts = append(exts, NewRedirectFourOctetAsSpecificExtended(10000000, 1000))
+	exts = append(exts, NewTrafficRemarkExtended(10))
+	m1 := NewPathAttributeExtendedCommunities(exts)
+	buf1, err := m1.Serialize()
+	require.NoError(t, err)
+
+	m2 := NewPathAttributeExtendedCommunities(nil)
+	err = m2.DecodeFromBytes(buf1)
+	require.NoError(t, err)
+
+	_, err = m2.Serialize()
+	require.NoError(t, err)
+
+	assert.Equal(m1, m2)
+}
+
+func Test_IP6FlowSpecExtended(t *testing.T) {
+	exts := make([]ExtendedCommunityInterface, 0)
+	ex, _ := NewRedirectIPv6AddressSpecificExtended(netip.MustParseAddr("2001:db8::68"), 1000)
+	exts = append(exts, ex)
+	m1 := NewPathAttributeIP6ExtendedCommunities(exts)
+	buf1, err := m1.Serialize()
+	require.NoError(t, err)
+
+	m2 := NewPathAttributeIP6ExtendedCommunities(nil)
+	err = m2.DecodeFromBytes(buf1)
+	require.NoError(t, err)
+
+	_, err = m2.Serialize()
+	require.NoError(t, err)
+
+	assert.Equal(t, m1, m2)
+}
+
+func Test_ExtendedCommunityDoesNotCrossCommunityBoundary(t *testing.T) {
+	assert := assert.New(t)
+
+	// RFC4360 Section 2 fixes every community in this attribute at 8
+	// octets, so a sub-type decoder must stay inside its own community. The
+	// first community below is the one sub-type that used to read 20 bytes,
+	// which took the two route targets that follow it and made the attribute
+	// re-serialize to 36 bytes.
+	value := []byte{
+		byte(EC_TYPE_GENERIC_TRANSITIVE_EXPERIMENTAL), 0x0b, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00,
+		byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC), byte(EC_SUBTYPE_ROUTE_TARGET), 0xfe, 0x4c, 0x00, 0x00, 0x00, 0x01,
+		byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC), byte(EC_SUBTYPE_ROUTE_TARGET), 0xfe, 0xb0, 0x00, 0x00, 0x00, 0x02,
+	}
+	buf := append([]byte{byte(BGP_ATTR_FLAG_OPTIONAL | BGP_ATTR_FLAG_TRANSITIVE), byte(BGP_ATTR_TYPE_EXTENDED_COMMUNITIES), byte(len(value))}, value...)
+
+	p := NewPathAttributeExtendedCommunities(nil)
+	require.NoError(t, p.DecodeFromBytes(buf))
+	require.Len(t, p.Value, 3)
+	assert.IsType(&UnknownExtended{}, p.Value[0])
+	assert.Equal("65100:1", p.Value[1].String())
+	assert.Equal("65200:2", p.Value[2].String())
+
+	out, err := p.Serialize()
+	require.NoError(t, err)
+	assert.Equal(buf, out)
+}
+
+func Test_RouteTargetMembershipNLRIDoesNotCrossNLRIBoundary(t *testing.T) {
+	assert := assert.New(t)
+
+	// The route target of a 96-bit RT membership NLRI is an 8-octet
+	// extended community, so decoding the first NLRI below must not reach
+	// into the second one.
+	buf := []byte{
+		96, 0x00, 0x00, 0xfd, 0xe8,
+		byte(EC_TYPE_GENERIC_TRANSITIVE_EXPERIMENTAL), 0x0b, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00,
+		96, 0x00, 0x00, 0xfd, 0xe9,
+		byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC), byte(EC_SUBTYPE_ROUTE_TARGET), 0xfe, 0x4c, 0x00, 0x00, 0x00, 0x01,
+	}
+
+	r := &RouteTargetMembershipNLRI{}
+	require.NoError(t, r.decodeFromBytes(buf))
+	assert.IsType(&UnknownExtended{}, r.RouteTarget)
+
+	out, err := r.Serialize()
+	require.NoError(t, err)
+	assert.Equal(r.Len(), len(out))
+	assert.Equal(buf[:13], out)
+}
+
+func Test_UnknownIP6Extended_RoundTrip(t *testing.T) {
+	assert := assert.New(t)
+
+	// 20-byte unknown IPv6 Extended Community (type 0x99, 19-byte value)
+	raw := []byte{
+		0x99, 0x77, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+		0x0f, 0x10, 0x11, 0x12,
+	}
+
+	e, err := ParseIP6Extended(raw)
+	require.NoError(t, err)
+
+	unknown, ok := e.(*UnknownIP6Extended)
+	require.True(t, ok, "expected *UnknownIP6Extended")
+	assert.Equal(ExtendedCommunityAttrType(0x99), unknown.Type)
+	assert.Equal(raw[1:], unknown.Value)
+
+	serialized, err := unknown.Serialize()
+	require.NoError(t, err)
+	assert.Equal(raw, serialized, "round-trip must be byte-for-byte identical")
+}
+
+func Test_UnknownIP6Extended_PathAttribute_RoundTrip(t *testing.T) {
+	assert := assert.New(t)
+
+	// Construct a PathAttributeIP6ExtendedCommunities with an unknown type.
+	// PathAttribute header (4 bytes) + 20-byte community value.
+	// Flags: optional+transitive = 0xc0, type = 25 (0x19), length = 20 (0x14)
+	raw := []byte{
+		0xc0, 0x19, 0x14,
+		0x99, 0x77, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+		0x0f, 0x10, 0x11, 0x12,
+	}
+
+	attr := &PathAttributeIP6ExtendedCommunities{}
+	err := attr.DecodeFromBytes(raw)
+	require.NoError(t, err)
+	require.Len(t, attr.Value, 1)
+
+	_, ok := attr.Value[0].(*UnknownIP6Extended)
+	assert.True(ok, "expected *UnknownIP6Extended")
+
+	serialized, err := attr.Serialize()
+	require.NoError(t, err)
+	assert.Equal(raw, serialized, "round-trip must be byte-for-byte identical")
+}
+
+func Test_UnknownIP6FlowSpecExtended_RoundTrip(t *testing.T) {
+	assert := assert.New(t)
+
+	// EC_TYPE_GENERIC_TRANSITIVE_EXPERIMENTAL (0x80) with unknown subtype
+	// so that parseIP6FlowSpecExtended falls through to the UnknownIP6Extended path.
+	raw := []byte{
+		0x80, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+		0x0f, 0x10, 0x11, 0x12,
+	}
+
+	e, err := ParseIP6Extended(raw)
+	require.NoError(t, err)
+
+	unknown, ok := e.(*UnknownIP6Extended)
+	require.True(t, ok, "expected *UnknownIP6Extended")
+	assert.Equal(raw[1:], unknown.Value)
+
+	serialized, err := unknown.Serialize()
+	require.NoError(t, err)
+	assert.Equal(raw, serialized, "round-trip must be byte-for-byte identical")
+}
+
+func Test_FlowSpecNlriv6(t *testing.T) {
+	cmp := make([]FlowSpecComponentInterface, 0)
+	nlri, _ := NewIPAddrPrefix(netip.MustParsePrefix("2001::/64"))
+	cmp = append(cmp, NewFlowSpecDestinationPrefix6(nlri, 12))
+	cmp = append(cmp, NewFlowSpecSourcePrefix6(nlri, 12))
+	item1 := NewFlowSpecComponentItem(DEC_NUM_OP_EQ, TCP)
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_IP_PROTO, []*FlowSpecComponentItem{item1}))
+	item2 := NewFlowSpecComponentItem(DEC_NUM_OP_GT_EQ, 20)
+	item3 := NewFlowSpecComponentItem(DEC_NUM_OP_AND|DEC_NUM_OP_LT_EQ, 30)
+	item4 := NewFlowSpecComponentItem(DEC_NUM_OP_EQ, 10)
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_PORT, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_DST_PORT, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_SRC_PORT, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_ICMP_TYPE, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_ICMP_CODE, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_PKT_LEN, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_DSCP, []*FlowSpecComponentItem{item2, item3, item4}))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_LABEL, []*FlowSpecComponentItem{item2, item3, item4}))
+	isFragment := uint64(0x02)
+	item5 := NewFlowSpecComponentItem(BITMASK_FLAG_OP_MATCH, isFragment)
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_FRAGMENT, []*FlowSpecComponentItem{item5}))
+	item6 := NewFlowSpecComponentItem(0, TCP_FLAG_ACK)
+	item7 := NewFlowSpecComponentItem(BITMASK_FLAG_OP_AND|BITMASK_FLAG_OP_NOT, TCP_FLAG_URGENT)
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_TCP_FLAG, []*FlowSpecComponentItem{item6, item7}))
+	n1, _ := NewFlowSpecUnicast(RF_FS_IPv6_UC, cmp)
+	buf1, err := n1.Serialize()
+	require.NoError(t, err)
+
+	n2, err := NLRIFromSlice(RF_FS_IPv6_UC, buf1)
+	require.NoError(t, err)
+
+	_, err = n2.Serialize()
+	require.NoError(t, err)
+
+	assert.Equal(t, n1, n2)
+}
+
+func Test_Aigp(t *testing.T) {
+	assert := assert.New(t)
+	m := NewAigpTLVIgpMetric(1000)
+	a1 := NewPathAttributeAigp([]AigpTLVInterface{m})
+	buf1, err := a1.Serialize()
+	require.NoError(t, err)
+
+	a2 := NewPathAttributeAigp(nil)
+	err = a2.DecodeFromBytes(buf1)
+	require.NoError(t, err)
+
+	assert.Equal(a1, a2)
+}
+
+func Test_FlowSpecNlriL2(t *testing.T) {
+	assert := assert.New(t)
+	mac, _ := net.ParseMAC("01:23:45:67:89:ab")
+	cmp := make([]FlowSpecComponentInterface, 0)
+	cmp = append(cmp, NewFlowSpecDestinationMac(mac))
+	cmp = append(cmp, NewFlowSpecSourceMac(mac))
+	item1 := NewFlowSpecComponentItem(DEC_NUM_OP_EQ, uint64(IPv4))
+	cmp = append(cmp, NewFlowSpecComponent(FLOW_SPEC_TYPE_ETHERNET_TYPE, []*FlowSpecComponentItem{item1}))
+	rd, _ := ParseRouteDistinguisher("100:100")
+	n1, _ := NewFlowSpecVPN(RF_FS_L2_VPN, rd, cmp)
+	buf1, err := n1.Serialize()
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_FS_L2_VPN, buf1)
+	assert.NoError(err)
+
+	assert.Equal(n1, n2)
+}
+
+func Test_NotificationErrorCode(t *testing.T) {
+	// boundary check
+	t.Log(NewNotificationErrorCode(BGP_ERROR_MESSAGE_HEADER_ERROR, BGP_ERROR_SUB_BAD_MESSAGE_TYPE).String())
+	t.Log(NewNotificationErrorCode(BGP_ERROR_MESSAGE_HEADER_ERROR, BGP_ERROR_SUB_BAD_MESSAGE_TYPE+1).String())
+	t.Log(NewNotificationErrorCode(BGP_ERROR_MESSAGE_HEADER_ERROR, 0).String())
+	t.Log(NewNotificationErrorCode(0, BGP_ERROR_SUB_BAD_MESSAGE_TYPE).String())
+	t.Log(NewNotificationErrorCode(BGP_ERROR_ROUTE_REFRESH_MESSAGE_ERROR+1, 0).String())
+}
+
+func Test_FlowSpecNlriVPN(t *testing.T) {
+	assert := assert.New(t)
+	cmp := make([]FlowSpecComponentInterface, 0)
+	destPrefix, _ := NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	cmp = append(cmp, NewFlowSpecDestinationPrefix(destPrefix))
+	srcPrefix, _ := NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	cmp = append(cmp, NewFlowSpecSourcePrefix(srcPrefix))
+	rd, _ := ParseRouteDistinguisher("100:100")
+	n1, _ := NewFlowSpecVPN(RF_FS_IPv4_VPN, rd, cmp)
+	buf1, err := n1.Serialize()
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_FS_IPv4_VPN, buf1)
+	require.NoError(t, err)
+
+	assert.Equal(n1, n2)
+}
+
+func Test_EVPNIPPrefixRoute(t *testing.T) {
+	assert := assert.New(t)
+	rd, _ := ParseRouteDistinguisher("100:100")
+	r := &EVPNIPPrefixRoute{
+		RD: rd,
+		ESI: EthernetSegmentIdentifier{
+			Type:  ESI_ARBITRARY,
+			Value: make([]byte, 9),
+		},
+		ETag:           10,
+		IPPrefixLength: 24,
+		IPPrefix:       netip.AddrFrom4([4]byte{10, 10, 10, 0}),
+		GWIPAddress:    netip.AddrFrom4([4]byte{10, 10, 10, 10}),
+		Label:          1000,
+	}
+	n1 := NewEVPNNLRI(EVPN_IP_PREFIX, r)
+	buf1, err := n1.Serialize()
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_EVPN, buf1)
+	assert.NoError(err)
+
+	assert.Equal(n1, n2)
+}
+
+func Test_EVPNIPPrefixRouteRejectsOversizedPrefixLength(t *testing.T) {
+	assert := assert.New(t)
+	rd, _ := ParseRouteDistinguisher("100:100")
+	esi := EthernetSegmentIdentifier{Type: ESI_ARBITRARY, Value: make([]byte, 9)}
+
+	v4 := NewEVPNNLRI(EVPN_IP_PREFIX, &EVPNIPPrefixRoute{
+		RD:             rd,
+		ESI:            esi,
+		ETag:           10,
+		IPPrefixLength: 24,
+		IPPrefix:       netip.AddrFrom4([4]byte{10, 10, 10, 0}),
+		GWIPAddress:    netip.AddrFrom4([4]byte{10, 10, 10, 10}),
+		Label:          1000,
+	})
+	buf, err := v4.Serialize()
+	assert.NoError(err)
+	// Wire layout: RouteType(1) + Length(1) + RD(8) + ESI(10) + ETag(4)
+	// + IPPrefixLength(1) ..., so the length octet is at index 24.
+	const plOffset = 2 + 22
+	buf[plOffset] = 33 // /33 cannot exist for an IPv4 EVPN prefix
+	_, err = NLRIFromSlice(RF_EVPN, buf)
+	assert.Error(err)
+	buf[plOffset] = 24 // a legal length still decodes
+	_, err = NLRIFromSlice(RF_EVPN, buf)
+	assert.NoError(err)
+
+	v6 := NewEVPNNLRI(EVPN_IP_PREFIX, &EVPNIPPrefixRoute{
+		RD:             rd,
+		ESI:            esi,
+		ETag:           10,
+		IPPrefixLength: 64,
+		IPPrefix:       netip.MustParseAddr("2001:db8::"),
+		GWIPAddress:    netip.MustParseAddr("2001:db8::1"),
+		Label:          1000,
+	})
+	buf6, err := v6.Serialize()
+	assert.NoError(err)
+	buf6[plOffset] = 129 // /129 cannot exist for an IPv6 EVPN prefix
+	_, err = NLRIFromSlice(RF_EVPN, buf6)
+	assert.Error(err)
+}
+
+func Test_GetRouteDistinguisherUnknownPreservesValue(t *testing.T) {
+	assert := assert.New(t)
+	// 8-byte RD with an unrecognized type (0x0003) and a nonzero value.
+	wire := []byte{0x00, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}
+	rd := GetRouteDistinguisher(wire)
+	buf, err := rd.Serialize()
+	assert.NoError(err)
+	assert.Equal(wire, buf)
+
+	// Two unknown RDs that differ only in their value must not collapse
+	// onto the same serialized form.
+	other := GetRouteDistinguisher([]byte{0x00, 0x03, 0xca, 0xfe, 0xba, 0xbe, 0x00, 0x02})
+	otherBuf, err := other.Serialize()
+	assert.NoError(err)
+	assert.NotEqual(buf, otherBuf)
+}
+
+func Test_RouteDistinguisherUnknownStringIncludesType(t *testing.T) {
+	assert := assert.New(t)
+
+	// The string must carry both the type and the value.
+	rd := GetRouteDistinguisher([]byte{0x00, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})
+	assert.Equal("3:deadbeef0001", rd.String())
+
+	// EVPN, MUP, VPLS and flowspec-VPN NLRIs are keyed on String(). Two
+	// unknown RDs that differ only in their type must not produce the same
+	// key.
+	sameValueOtherType := GetRouteDistinguisher([]byte{0x00, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})
+	assert.NotEqual(rd.String(), sameValueOtherType.String())
+
+	// The value is 12 hex digits, so it never looks like the decimal
+	// "admin:assigned" form of a known RD type.
+	known := NewRouteDistinguisherTwoOctetAS(3, 123456)
+	leadingZeros := GetRouteDistinguisher([]byte{0x00, 0x03, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56})
+	assert.NotEqual(known.String(), leadingZeros.String())
+
+	// The same must hold once the RD is carried inside a real NLRI.
+	evpn := func(rdWire []byte) string {
+		return NewEVPNNLRI(EVPN_INCLUSIVE_MULTICAST_ETHERNET_TAG, &EVPNMulticastEthernetTagRoute{
+			RD:              GetRouteDistinguisher(rdWire),
+			ETag:            100,
+			IPAddressLength: 32,
+			IPAddress:       netip.MustParseAddr("10.0.0.1"),
+		}).String()
+	}
+	assert.NotEqual(
+		evpn([]byte{0x00, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}),
+		evpn([]byte{0x00, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}),
+	)
+
+	// A hand-built RD with no value must not panic.
+	assert.Equal("5:", (&RouteDistinguisherUnknown{
+		DefaultRouteDistinguisher: DefaultRouteDistinguisher{Type: 5},
+	}).String())
+}
+
+func Test_EVPNMacIPAdvertisementRoute(t *testing.T) {
+	rd, err := ParseRouteDistinguisher("100:100")
+	require.NoError(t, err)
+	esi := EthernetSegmentIdentifier{Type: ESI_ARBITRARY, Value: make([]byte, 9)}
+	mac := "aa:bb:cc:dd:ee:ff"
+
+	t.Run("MAC-only NLRI", func(t *testing.T) {
+		nl, err := NewEVPNMacIPAdvertisementRoute(rd, esi, 42, mac, netip.Addr{}, []uint32{200})
+		require.NoError(t, err)
+		r := nl.RouteTypeData.(*EVPNMacIPAdvertisementRoute)
+		assert.Equal(t, uint8(0), r.IPAddressLength)
+		assert.False(t, r.IPAddress.IsValid())
+	})
+
+	t.Run("IPv4 host address", func(t *testing.T) {
+		ip := netip.MustParseAddr("10.0.0.1")
+		nl, err := NewEVPNMacIPAdvertisementRoute(rd, esi, 42, mac, ip, nil)
+		require.NoError(t, err)
+		r := nl.RouteTypeData.(*EVPNMacIPAdvertisementRoute)
+		assert.Equal(t, uint8(32), r.IPAddressLength)
+		assert.Equal(t, ip, r.IPAddress)
+	})
+
+	t.Run("IPv6 host address", func(t *testing.T) {
+		ip := netip.MustParseAddr("2001:db8::1")
+		nl, err := NewEVPNMacIPAdvertisementRoute(rd, esi, 42, mac, ip, nil)
+		require.NoError(t, err)
+		r := nl.RouteTypeData.(*EVPNMacIPAdvertisementRoute)
+		assert.Equal(t, uint8(128), r.IPAddressLength)
+		assert.Equal(t, ip, r.IPAddress)
+	})
+}
+
+func Test_EVPNMacIPAdvertisementRoute_MarshalJSON(t *testing.T) {
+	rd, err := ParseRouteDistinguisher("100:100")
+	require.NoError(t, err)
+	esi := EthernetSegmentIdentifier{Type: ESI_ARBITRARY, Value: make([]byte, 9)}
+	mac := "aa:bb:cc:dd:ee:ff"
+
+	t.Run("omits ip key when IPAddressLength is 0", func(t *testing.T) {
+		r := &EVPNMacIPAdvertisementRoute{
+			RD:               rd,
+			ESI:              esi,
+			ETag:             7,
+			MacAddressLength: 48,
+			MacAddress:       mustParseMAC(t, mac),
+			IPAddressLength:  0,
+			IPAddress:        netip.Addr{},
+			Labels:           []uint32{300},
+		}
+		b, err := r.MarshalJSON()
+		require.NoError(t, err)
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(b, &m))
+		_, hasIP := m["ip"]
+		assert.False(t, hasIP)
+	})
+
+	t.Run("includes ip when IPAddressLength is non-zero", func(t *testing.T) {
+		r := &EVPNMacIPAdvertisementRoute{
+			RD:               rd,
+			ESI:              esi,
+			ETag:             7,
+			MacAddressLength: 48,
+			MacAddress:       mustParseMAC(t, mac),
+			IPAddressLength:  32,
+			IPAddress:        netip.MustParseAddr("192.0.2.1"),
+			Labels:           []uint32{300},
+		}
+		b, err := r.MarshalJSON()
+		require.NoError(t, err)
+		var m map[string]any
+		require.NoError(t, json.Unmarshal(b, &m))
+		assert.Equal(t, "192.0.2.1", m["ip"])
+	})
+}
+
+func mustParseMAC(t *testing.T, s string) net.HardwareAddr {
+	t.Helper()
+	m, err := net.ParseMAC(s)
+	require.NoError(t, err)
+	return m
+}
+
+func Test_CapExtendedNexthop(t *testing.T) {
+	assert := assert.New(t)
+	tuple := NewCapExtendedNexthopTuple(RF_IPv4_UC, AFI_IP6)
+	n1 := NewCapExtendedNexthop([]*CapExtendedNexthopTuple{tuple})
+	buf1, err := n1.Serialize()
+	assert.NoError(err)
+	n2, err := DecodeCapability(buf1)
+	assert.NoError(err)
+
+	// Compare the wire form and the decoded tuples. A decoded capability
+	// keeps the CapLen and CapValue it read off the wire, and a capability
+	// built in memory does not, so the structs do not match.
+	buf2, err := n2.Serialize()
+	assert.NoError(err)
+	assert.Equal(buf1, buf2)
+	assert.Equal(n1.Tuples, n2.(*CapExtendedNexthop).Tuples)
+}
+
+func Test_AddPath(t *testing.T) {
+	assert := assert.New(t)
+	opt := &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_IPv4_UC: BGP_ADD_PATH_BOTH}}
+	{
+		n1, _ := NewIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{{NLRI: n1, ID: 10}}, []PathAttributeInterface{}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.WithdrawnRoutes[0].ID, uint32(10))
+
+		m1 = NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{}, []PathNLRI{{NLRI: n1, ID: 20}})
+		bits, err = m1.Body.Serialize(opt)
+		assert.NoError(err)
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.NLRI[0].ID, uint32(20))
+	}
+
+	{
+		n1, _ := NewIPAddrPrefix(netip.MustParsePrefix("2001::/64"))
+		mp, _ := NewPathAttributeMpReachNLRI(RF_IPv6_UC, []PathNLRI{{NLRI: n1, ID: 10}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(0))
+	}
+
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_IPv4_UC: BGP_ADD_PATH_BOTH, RF_IPv6_UC: BGP_ADD_PATH_BOTH}}
+	{
+		n1, _ := NewIPAddrPrefix(netip.MustParsePrefix("2001::/64"))
+		mp, _ := NewPathAttributeMpReachNLRI(RF_IPv6_UC, []PathNLRI{{NLRI: n1, ID: 10}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(10))
+	}
+
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_IPv4_VPN: BGP_ADD_PATH_BOTH, RF_IPv6_VPN: BGP_ADD_PATH_BOTH}}
+	{
+		rd, _ := ParseRouteDistinguisher("100:100")
+		labels := NewMPLSLabelStack(100, 200)
+		n1, _ := NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24"), *labels, rd)
+		mp, _ := NewPathAttributeMpReachNLRI(RF_IPv4_VPN, []PathNLRI{{NLRI: n1, ID: 10}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(10))
+	}
+	{
+		rd, _ := ParseRouteDistinguisher("100:100")
+		labels := NewMPLSLabelStack(100, 200)
+		n1, _ := NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("2001::/64"), *labels, rd)
+		mp, _ := NewPathAttributeMpReachNLRI(RF_IPv6_VPN, []PathNLRI{{NLRI: n1, ID: 20}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(20))
+	}
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_IPv4_MPLS: BGP_ADD_PATH_BOTH, RF_IPv6_MPLS: BGP_ADD_PATH_BOTH}}
+	{
+		labels := NewMPLSLabelStack(100, 200)
+		n1, _ := NewLabeledIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24"), *labels)
+		mp, _ := NewPathAttributeMpReachNLRI(RF_IPv4_MPLS, []PathNLRI{{NLRI: n1, ID: 20}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(20))
+	}
+	{
+		labels := NewMPLSLabelStack(100, 200)
+		n1, _ := NewLabeledIPAddrPrefix(netip.MustParsePrefix("2001::/64"), *labels)
+		mp, _ := NewPathAttributeMpReachNLRI(RF_IPv6_MPLS, []PathNLRI{{NLRI: n1, ID: 20}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(20))
+	}
+
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_RTC_UC: BGP_ADD_PATH_BOTH}}
+	{
+		rt, _ := ParseRouteTarget("100:100")
+		n1 := NewRouteTargetMembershipNLRI(65000, rt)
+		mp, _ := NewPathAttributeMpReachNLRI(RF_RTC_UC, []PathNLRI{{NLRI: n1, ID: 30}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(30))
+	}
+
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_EVPN: BGP_ADD_PATH_BOTH}}
+	{
+		n1 := NewEVPNNLRI(EVPN_ROUTE_TYPE_ETHERNET_AUTO_DISCOVERY,
+			&EVPNEthernetAutoDiscoveryRoute{
+				NewRouteDistinguisherFourOctetAS(5, 6),
+				EthernetSegmentIdentifier{ESI_ARBITRARY, make([]byte, 9)},
+				2, 2,
+			})
+		mp, _ := NewPathAttributeMpReachNLRI(RF_EVPN, []PathNLRI{{NLRI: n1, ID: 40}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(40))
+	}
+
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_IPv4_ENCAP: BGP_ADD_PATH_BOTH}}
+	{
+		n1, _ := NewEncapNLRI(netip.MustParseAddr("10.10.10.0"))
+		mp, _ := NewPathAttributeMpReachNLRI(RF_IPv4_ENCAP, []PathNLRI{{NLRI: n1, ID: 50}}, netip.MustParseAddr("::1"))
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(50))
+	}
+
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_FS_IPv4_UC: BGP_ADD_PATH_BOTH}}
+	{
+		prefix, _ := NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+		n1, _ := NewFlowSpecUnicast(RF_FS_IPv4_UC, []FlowSpecComponentInterface{NewFlowSpecDestinationPrefix(prefix)})
+		mp, _ := NewPathAttributeMpReachNLRI(RF_FS_IPv4_UC, []PathNLRI{{NLRI: n1, ID: 60}})
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(60))
+	}
+
+	opt = &MarshallingOption{AddPath: map[Family]BGPAddPathMode{RF_OPAQUE: BGP_ADD_PATH_BOTH}}
+	{
+		n1 := NewOpaqueNLRI([]byte("key"), []byte("value"))
+		mp, _ := NewPathAttributeMpReachNLRI(RF_OPAQUE, []PathNLRI{{NLRI: n1, ID: 70}})
+		m1 := NewBGPUpdateMessage([]PathNLRI{}, []PathAttributeInterface{mp}, []PathNLRI{})
+		bits, err := m1.Body.Serialize(opt)
+		assert.NoError(err)
+		m2 := BGPUpdate{}
+		err = m2.DecodeFromBytes(bits, opt)
+		assert.NoError(err)
+		assert.Equal(m2.PathAttributes[0].(*PathAttributeMpReachNLRI).Value[0].ID, uint32(70))
+	}
+}
+
+func Test_CompareFlowSpecNLRI(t *testing.T) {
+	assert := assert.New(t)
+	cmp, err := ParseFlowSpecComponents(RF_FS_IPv4_UC, "destination 10.0.0.2/32 source 10.0.0.1/32 destination-port ==3128 protocol tcp")
+	assert.NoError(err)
+	// Note: Use NewFlowSpecIPv4Unicast() for the consistent ordered rules.
+	n1, _ := NewFlowSpecUnicast(RF_FS_IPv4_UC, cmp)
+	cmp, err = ParseFlowSpecComponents(RF_FS_IPv4_UC, "source 10.0.0.0/24 destination-port ==3128 protocol tcp")
+	assert.NoError(err)
+	n2, _ := NewFlowSpecUnicast(RF_FS_IPv4_UC, cmp)
+	r, err := CompareFlowSpecNLRI(n1, n2)
+	assert.NoError(err)
+	assert.True(r > 0)
+	cmp, err = ParseFlowSpecComponents(RF_FS_IPv4_UC, "source 10.0.0.9/32 port ==80 ==8080 destination-port >8080&<8080 ==3128 source-port >1024 protocol ==udp ==tcp")
+	n3, _ := NewFlowSpecUnicast(RF_FS_IPv4_UC, cmp)
+	assert.NoError(err)
+	cmp, err = ParseFlowSpecComponents(RF_FS_IPv4_UC, "destination 192.168.0.2/32")
+	n4, _ := NewFlowSpecUnicast(RF_FS_IPv4_UC, cmp)
+	assert.NoError(err)
+	r, err = CompareFlowSpecNLRI(n3, n4)
+	assert.NoError(err)
+	assert.True(r < 0)
+}
+
+func Test_ParseFlowSpecComponents_DoesNotPanicOnInvalidInput(t *testing.T) {
+	// Regression: some inputs pass ParseFlowSpecComponents()'s len(args)>0 check
+	// but are discarded by normalizeFlowSpecOpValues(), leading to argsLen==0 and
+	// a panic when marking the end-of-list bit.
+	cases := []string{
+		"dscp foo",
+		"tcp-flags foo",
+		"fragment foo",
+	}
+
+	for _, c := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("ParseFlowSpecComponents must not panic for %q: %v", c, r)
+				}
+			}()
+			_, err := ParseFlowSpecComponents(RF_FS_IPv4_UC, c)
+			if err == nil {
+				t.Fatalf("expected error for %q", c)
+			}
+		}()
+	}
+}
+
+func TestMpReachDecodeDoesNotMutateInputWhenDeletingSecondRD(t *testing.T) {
+	// Triggers nexthoplen == 2*RD + (IPv6 global + link-local)
+	// and ensures DecodeFromBytes does not modify the input buffer.
+	flags := uint8(0x80) // optional
+	typ := uint8(BGP_ATTR_TYPE_MP_REACH_NLRI)
+
+	// Value layout:
+	// AFI(2) + SAFI(1) + NHLen(1) + NH(48) + SNPA len/reserved(1) + NLRI(0)
+	value := make([]byte, 0, 2+1+1+48+1)
+	value = append(value, 0x00, 0x02)                        // AFI_IP6
+	value = append(value, 0x80)                              // SAFI_MPLS_VPN
+	value = append(value, 48)                                // NHLen
+	value = append(value, bytes.Repeat([]byte{0x11}, 8)...)  // RD1
+	value = append(value, bytes.Repeat([]byte{0x22}, 16)...) // IPv6 global
+	value = append(value, bytes.Repeat([]byte{0x33}, 8)...)  // RD2 (to be removed)
+	value = append(value, bytes.Repeat([]byte{0x44}, 16)...) // IPv6 link-local
+	value = append(value, 0x00)                              // SNPA len (skipped)
+
+	attr := make([]byte, 0, 3+len(value))
+	attr = append(attr, flags, typ, uint8(len(value)))
+	attr = append(attr, value...)
+
+	data := bytes.Clone(attr)
+	before := bytes.Clone(data)
+
+	p := &PathAttributeMpReachNLRI{}
+	err := p.DecodeFromBytes(data)
+	require.NoError(t, err)
+	require.Equal(t, before, data, "DecodeFromBytes must not mutate the input buffer")
+}
+
+func TestMpReachZeroNexthopFamilyValidation(t *testing.T) {
+	// A zero-length next hop is only valid for families that carry no next
+	// hop (FlowSpec, and gobgp's opaque family); it is malformed for any
+	// other family. See RFC 4760 section 3 and GH #3450.
+	// Build an otherwise well-formed MP_REACH_NLRI attribute with a
+	// zero-length next hop, so the only reason to reject it is the family
+	// check (without the fix the message decodes cleanly).
+	mpReachZeroNexthop := func(afi uint16, safi uint8, nlri []byte) []byte {
+		// AFI(2) + SAFI(1) + NextHopLength(1)=0 + reserved(1) + NLRI
+		value := []byte{byte(afi >> 8), byte(afi), safi, 0x00, 0x00}
+		value = append(value, nlri...)
+		attr := []byte{0x80, byte(BGP_ATTR_TYPE_MP_REACH_NLRI), byte(len(value))}
+		return append(attr, value...)
+	}
+
+	rejected := []struct {
+		name string
+		afi  uint16
+		safi uint8
+		nlri []byte
+	}{
+		{"ipv4-unicast", AFI_IP, SAFI_UNICAST, []byte{0x18, 0x0a, 0x00, 0x00}},        // 10.0.0.0/24
+		{"ipv6-unicast", AFI_IP6, SAFI_UNICAST, []byte{0x20, 0x20, 0x01, 0x0d, 0xb8}}, // 2001:db8::/32
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &PathAttributeMpReachNLRI{}
+			err := p.DecodeFromBytes(mpReachZeroNexthop(tc.afi, tc.safi, tc.nlri))
+			require.Error(t, err, "zero-length next hop must be rejected for %s", tc.name)
+		})
+	}
+
+	// FlowSpec carries no next hop, so a zero-length next hop is valid and
+	// must still round-trip.
+	t.Run("flowspec-accepted", func(t *testing.T) {
+		destPrefix, err := NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+		require.NoError(t, err)
+		nlri, err := NewFlowSpecUnicast(RF_FS_IPv4_UC, []FlowSpecComponentInterface{
+			NewFlowSpecDestinationPrefix(destPrefix),
+		})
+		require.NoError(t, err)
+		mp, err := NewPathAttributeMpReachNLRI(RF_FS_IPv4_UC, []PathNLRI{{NLRI: nlri}})
+		require.NoError(t, err)
+		buf, err := mp.Serialize()
+		require.NoError(t, err)
+		require.NoError(t, (&PathAttributeMpReachNLRI{}).DecodeFromBytes(buf))
+	})
+}
+
+func Test_MpReachNLRIWithIPv4MappedIPv6Prefix(t *testing.T) {
+	assert := assert.New(t)
+	n1, _ := NewIPAddrPrefix(netip.MustParsePrefix("::ffff:10.0.0.0/120"))
+	buf1, err := n1.Serialize()
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_IPv6_UC, buf1)
+	assert.NoError(err)
+
+	assert.Equal(n1, n2)
+
+	label := NewMPLSLabelStack(2)
+
+	n3, _ := NewLabeledIPAddrPrefix(netip.MustParsePrefix("::ffff:10.0.0.0/120"), *label)
+	buf1, err = n3.Serialize()
+	assert.NoError(err)
+	n4, err := NLRIFromSlice(RF_IPv6_MPLS, buf1)
+	assert.NoError(err)
+
+	assert.Equal(n3, n4)
+}
+
+func Test_MpReachNLRIWithIPv6PrefixWithIPv4Peering(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x80, 0x0e, 0x1e, // flags(1), type(1), length(1)
+		0x00, 0x02, 0x01, 0x10, // afi(2), safi(1), nexthoplen(1)
+		0x00, 0x00, 0x00, 0x00, // nexthop(16)
+		0x00, 0x00, 0x00, 0x00, // = "::ffff:172.20.0.1"
+		0x00, 0x00, 0xff, 0xff,
+		0xac, 0x14, 0x00, 0x01,
+		0x00,                   // reserved(1)
+		0x40, 0x20, 0x01, 0x0d, // nlri(9)
+		0xb8, 0x00, 0x01, 0x00, // = "2001:db8:1:1::/64"
+		0x01,
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpReachNLRI{}
+	err := p.DecodeFromBytes(bufin)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x80), p.Flags)
+	assert.Equal(BGPAttrType(0xe), p.Type)
+	assert.Equal(uint16(0x1e), p.Length)
+	assert.Equal(uint16(AFI_IP6), p.AFI)
+	assert.Equal(uint8(SAFI_UNICAST), p.SAFI)
+	assert.Equal(netip.MustParseAddr("::ffff:172.20.0.1"), p.Nexthop)
+	assert.False(p.LinkLocalNexthop.IsValid())
+	nlri, _ := NewIPAddrPrefix(netip.MustParsePrefix("2001:db8:1:1::/64"))
+	value := []PathNLRI{{NLRI: nlri}}
+	assert.Equal(value, p.Value)
+	// Set NextHop as IPv4 address (because IPv4 peering)
+	p.Nexthop = netip.MustParseAddr("172.20.0.1")
+	// Test Serialize()
+	bufout, err := p.Serialize()
+	assert.NoError(err)
+	// Test serialised value
+	assert.Equal(bufin, bufout)
+}
+
+func Test_MpReachNLRIWithIPv6(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x90, 0x0e, 0x00, 0x1e, // flags(1), type(1), length(2),
+		0x00, 0x02, 0x01, 0x10, // afi(2), safi(1), nexthoplen(1)
+		0x20, 0x01, 0x0d, 0xb8, // nexthop(16)
+		0x00, 0x01, 0x00, 0x00, // = "2001:db8:1::1"
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,                   // reserved(1)
+		0x40, 0x20, 0x01, 0x0d, // nlri(9)
+		0xb8, 0x00, 0x53, 0x00, // = "2001:db8:53::/64"
+		0x00,
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpReachNLRI{}
+	err := p.DecodeFromBytes(bufin)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x90), p.Flags)
+	assert.Equal(BGPAttrType(0xe), p.Type)
+	assert.Equal(uint16(0x1e), p.Length)
+	assert.Equal(uint16(AFI_IP6), p.AFI)
+	assert.Equal(uint8(SAFI_UNICAST), p.SAFI)
+	assert.Equal(netip.MustParseAddr("2001:db8:1::1"), p.Nexthop)
+	nlri, _ := NewIPAddrPrefix(netip.MustParsePrefix("2001:db8:53::/64"))
+	value := []PathNLRI{{NLRI: nlri}}
+	assert.Equal(value, p.Value)
+}
+
+func Test_MpUnreachNLRIWithIPv6(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x90, 0x0f, 0x00, 0x0c, // flags(1), type(1), length(2),
+		0x00, 0x02, 0x01, // afi(2), safi(1),
+		0x40, 0x20, 0x01, 0x0d, // nlri(9)
+		0xb8, 0x00, 0x53, 0x00, // = "2001:db8:53::/64"
+		0x00,
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpUnreachNLRI{}
+	err := p.DecodeFromBytes(bufin)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x90), p.Flags)
+	assert.Equal(BGPAttrType(0xf), p.Type)
+	assert.Equal(uint16(0x0c), p.Length)
+	assert.Equal(uint16(AFI_IP6), p.AFI)
+	assert.Equal(uint8(SAFI_UNICAST), p.SAFI)
+	nlri, _ := NewIPAddrPrefix(netip.MustParsePrefix("2001:db8:53::/64"))
+	value := []PathNLRI{{NLRI: nlri}}
+	assert.Equal(value, p.Value)
+}
+
+func Test_MpReachNLRIWithIPv6PrefixWithLinkLocalNexthop(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x80, 0x0e, 0x2c, // flags(1), type(1), length(1)
+		0x00, 0x02, 0x01, 0x20, // afi(2), safi(1), nexthoplen(1)
+		0x20, 0x01, 0x0d, 0xb8, // nexthop(32)
+		0x00, 0x01, 0x00, 0x00, // = "2001:db8:1::1"
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		0xfe, 0x80, 0x00, 0x00, // + "fe80::1" (link local)
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,                   // reserved(1)
+		0x30, 0x20, 0x10, 0x0a, // nlri(7)
+		0xb8, 0x00, 0x01, // = "2010:ab8:1::/48"
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpReachNLRI{}
+	err := p.DecodeFromBytes(bufin)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x80), p.Flags)
+	assert.Equal(BGPAttrType(0xe), p.Type)
+	assert.Equal(uint16(0x2c), p.Length)
+	assert.Equal(uint16(AFI_IP6), p.AFI)
+	assert.Equal(uint8(SAFI_UNICAST), p.SAFI)
+	assert.Equal(netip.MustParseAddr("2001:db8:1::1"), p.Nexthop)
+	assert.Equal(netip.MustParseAddr("fe80::1"), p.LinkLocalNexthop)
+	nlri, _ := NewIPAddrPrefix(netip.MustParsePrefix("2010:ab8:1::/48"))
+	value := []PathNLRI{{NLRI: nlri}}
+	assert.Equal(value, p.Value)
+	// Test Serialize()
+	bufout, err := p.Serialize()
+	assert.NoError(err)
+	// Test serialised value
+	assert.Equal(bufin, bufout)
+}
+
+func Test_MpReachNLRIWithVPNv4Prefix(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x80, 0x0e, 0x20, // flags(1), type(1), length(1)
+		0x00, 0x01, 0x80, 0x0c, // afi(2), safi(1), nexthoplen(1)
+		0x00, 0x00, 0x00, 0x00, // nexthop(12)
+		0x00, 0x00, 0x00, 0x00, // = (rd:"0:0",) "172.20.0.1"
+		0xac, 0x14, 0x00, 0x01,
+		0x00,                   // reserved(1)
+		0x70, 0x00, 0x01, 0x01, // nlri(15)
+		0x00, 0x00, 0xfd, 0xe8, // = label:16, rd:"65000:100", prefix:"10.1.1.0/24"
+		0x00, 0x00, 0x00, 0x64,
+		0x0a, 0x01, 0x01,
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpReachNLRI{}
+	err := p.DecodeFromBytes(bufin)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x80), p.Flags)
+	assert.Equal(BGPAttrType(0xe), p.Type)
+	assert.Equal(uint16(0x20), p.Length)
+	assert.Equal(uint16(AFI_IP), p.AFI)
+	assert.Equal(uint8(SAFI_MPLS_VPN), p.SAFI)
+	assert.Equal(netip.MustParseAddr("172.20.0.1"), p.Nexthop)
+	assert.False(p.LinkLocalNexthop.IsValid())
+	n, _ := NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("10.1.1.0/24"), *NewMPLSLabelStack(16),
+		NewRouteDistinguisherTwoOctetAS(65000, 100))
+	value := []PathNLRI{{NLRI: n}}
+	assert.Equal(value, p.Value)
+	// Test Serialize()
+	bufout, err := p.Serialize()
+	assert.NoError(err)
+	// Test serialised value
+	assert.Equal(bufin, bufout)
+}
+
+func Test_MpReachNLRIWithVPNv6Prefix(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x80, 0x0e, 0x39, // flags(1), type(1), length(1)
+		0x00, 0x02, 0x80, 0x18, // afi(2), safi(1), nexthoplen(1)
+		0x00, 0x00, 0x00, 0x00, // nexthop(24)
+		0x00, 0x00, 0x00, 0x00, // = (rd:"0:0",) "2001:db8:1::1"
+		0x20, 0x01, 0x0d, 0xb8,
+		0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,                   // reserved(1)
+		0xd4, 0x00, 0x01, 0x01, // nlri(28)
+		0x00, 0x00, 0xfd, 0xe8, // = label:16, rd:"65000:100", prefix:"2001:1::/124"
+		0x00, 0x00, 0x00, 0x64,
+		0x20, 0x01, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpReachNLRI{}
+	err := p.DecodeFromBytes(bufin)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x80), p.Flags)
+	assert.Equal(BGPAttrType(0xe), p.Type)
+	assert.Equal(uint16(0x39), p.Length)
+	assert.Equal(uint16(AFI_IP6), p.AFI)
+	assert.Equal(uint8(SAFI_MPLS_VPN), p.SAFI)
+	assert.Equal(netip.MustParseAddr("2001:db8:1::1"), p.Nexthop)
+	assert.False(p.LinkLocalNexthop.IsValid())
+	nlri, _ := NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("2001:1::/124"), *NewMPLSLabelStack(16), NewRouteDistinguisherTwoOctetAS(65000, 100))
+	value := []PathNLRI{{NLRI: nlri}}
+	assert.Equal(value, p.Value)
+	// Test Serialize()
+	bufout, err := p.Serialize()
+	assert.NoError(err)
+	// Test serialised value
+	assert.Equal(bufin, bufout)
+}
+
+func Test_MpReachNLRIWithIPv4PrefixWithIPv6Nexthop(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x80, 0x0e, 0x19, // flags(1), type(1), length(1)
+		0x00, 0x01, 0x01, 0x10, // afi(1), safi(1), nexthoplen(1)
+		0x20, 0x01, 0x0d, 0xb8, // nexthop(32)
+		0x00, 0x01, 0x00, 0x00, // = "2001:db8:1::1"
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,                   // reserved(1)
+		0x18, 0xc0, 0xa8, 0x0a, // nlri(7)
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpReachNLRI{}
+	err := p.DecodeFromBytes(bufin)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x80), p.Flags)
+	assert.Equal(BGPAttrType(0xe), p.Type)
+	assert.Equal(uint16(0x19), p.Length)
+	assert.Equal(uint8(AFI_IP), p.SAFI)
+	assert.Equal(uint8(SAFI_UNICAST), p.SAFI)
+	assert.Equal(netip.MustParseAddr("2001:db8:1::1"), p.Nexthop)
+	prefix, _ := NewIPAddrPrefix(netip.MustParsePrefix("192.168.10.0/24"))
+	value := []PathNLRI{{NLRI: prefix}}
+	assert.Equal(value, p.Value)
+	// Test Serialize()
+	bufout, err := p.Serialize()
+	assert.NoError(err)
+	// Test serialised value
+	assert.Equal(bufin, bufout)
+}
+
+func Test_MpReachNLRIWithImplicitPrefix(t *testing.T) {
+	assert := assert.New(t)
+	bufin := []byte{
+		0x80, 0x0e, 0x11, // flags(1), type(1), length(1)
+		0x10,                   // nexthoplen(1)
+		0x20, 0x01, 0x0d, 0xb8, // nexthop(32)
+		0x00, 0x01, 0x00, 0x00, // = "2001:db8:1::1"
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+	}
+	// Test DecodeFromBytes()
+	p := &PathAttributeMpReachNLRI{}
+	options := &MarshallingOption{MRT: true}
+	err := p.DecodeFromBytes(bufin, options)
+	assert.NoError(err)
+	// Test decoded values
+	assert.Equal(BGPAttrFlag(0x80), p.Flags)
+	assert.Equal(BGPAttrType(0xe), p.Type)
+	assert.Equal(uint16(0x11), p.Length)
+	assert.Equal(netip.MustParseAddr("2001:db8:1::1"), p.Nexthop)
+	// AFI/SAFI/NLRI are derived from the Rib header
+	// which we don't have here.
+	// assert.Equal(prefix.AFI(), p.AFI)
+	// assert.Equal(prefix.SAFI(), p.SAFI)
+	// prefix, _ := NewIPAddrPrefix(netip.MustParsePrefix("192.168.10.0/24"))
+	// value := []NLRI{prefix}
+	// assert.Equal(value, p.Value)
+	// Test Serialize()
+	bufout, err := p.Serialize(options)
+	assert.NoError(err)
+	// Test serialised value
+	assert.Equal(bufin, bufout)
+}
+
+func Test_ParseRouteDistinguisher(t *testing.T) {
+	assert := assert.New(t)
+
+	rd, _ := ParseRouteDistinguisher("100:1000")
+	rdType0, ok := rd.(*RouteDistinguisherTwoOctetAS)
+	if !ok {
+		t.Fatal("Type of RD interface is not RouteDistinguisherTwoOctetAS")
+	}
+
+	assert.Equal(uint16(100), rdType0.Admin)
+	assert.Equal(uint32(1000), rdType0.Assigned)
+
+	rd, _ = ParseRouteDistinguisher("10.0.0.0:100")
+	rdType1, ok := rd.(*RouteDistinguisherIPAddressAS)
+	if !ok {
+		t.Fatal("Type of RD interface is not RouteDistinguisherIPAddressAS")
+	}
+
+	assert.Equal("10.0.0.0", rdType1.Admin.String())
+	assert.Equal(uint16(100), rdType1.Assigned)
+
+	rd, _ = ParseRouteDistinguisher("100.1000:10000")
+	rdType2, ok := rd.(*RouteDistinguisherFourOctetAS)
+	if !ok {
+		t.Fatal("Type of RD interface is not RouteDistinguisherFourOctetAS")
+	}
+
+	assert.Equal(uint32(100<<16|1000), rdType2.Admin)
+	assert.Equal(uint16(10000), rdType2.Assigned)
+}
+
+func TestParseVPNPrefix(t *testing.T) {
+	rdip, _ := NewRouteDistinguisherIPAddressAS(netip.MustParseAddr("1.1.1.1"), uint16(100))
+	tests := []struct {
+		name     string
+		prefix   string
+		valid    bool
+		rd       RouteDistinguisherInterface
+		ipPrefix string
+	}{
+		{
+			name:     "test valid RD type 0 VPNv4 prefix",
+			prefix:   "100:100:10.0.0.1/32",
+			valid:    true,
+			rd:       NewRouteDistinguisherTwoOctetAS(uint16(100), uint32(100)),
+			ipPrefix: "10.0.0.1/32",
+		},
+		{
+			name:     "test valid RD type 1 VPNv4 prefix",
+			prefix:   "1.1.1.1:100:10.0.0.1/32",
+			valid:    true,
+			rd:       rdip,
+			ipPrefix: "10.0.0.1/32",
+		},
+		{
+			name:     "test valid RD type 2 VPNv4 prefix",
+			prefix:   "0.54233:100:10.0.0.1/32",
+			valid:    true,
+			rd:       NewRouteDistinguisherFourOctetAS(uint32(54233), uint16(100)),
+			ipPrefix: "10.0.0.1/32",
+		},
+		{
+			name:     "test invalid VPNv4 prefix",
+			prefix:   "100:10.0.0.1/32",
+			valid:    false,
+			rd:       nil,
+			ipPrefix: "",
+		},
+		{
+			name:     "test valid RD type 0 VPNv6 prefix",
+			prefix:   "100:100:100:1::/64",
+			valid:    true,
+			rd:       NewRouteDistinguisherTwoOctetAS(uint16(100), uint32(100)),
+			ipPrefix: "100:1::/64",
+		},
+		{
+			name:     "test valid RD type 1 VPNv6 prefix",
+			prefix:   "1.1.1.1:100:100:1::/64",
+			valid:    true,
+			rd:       rdip,
+			ipPrefix: "100:1::/64",
+		},
+		{
+			name:     "test valid RD type 2 VPNv6 prefix",
+			prefix:   "0.54233:100:100:1::/64",
+			valid:    true,
+			rd:       NewRouteDistinguisherFourOctetAS(uint32(54233), uint16(100)),
+			ipPrefix: "100:1::/64",
+		},
+		{
+			name:     "test invalid VPNv6 prefix",
+			prefix:   "100:1::/64",
+			valid:    false,
+			rd:       nil,
+			ipPrefix: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rd, prefix, err := ParseVPNPrefix(tt.prefix)
+			if !tt.valid {
+				assert.NotNil(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.rd, rd)
+			assert.Equal(t, tt.ipPrefix, prefix.String())
+		})
+	}
+}
+
+func Test_ParseEthernetSegmentIdentifier(t *testing.T) {
+	assert := assert.New(t)
+
+	// "single-homed"
+	esiZero := EthernetSegmentIdentifier{}
+	args := make([]string, 0)
+	esi, err := ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(esiZero, esi)
+	args = []string{"single-homed"}
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(esiZero, esi)
+
+	// ESI_ARBITRARY
+	args = []string{"ARBITRARY", "11:22:33:44:55:66:77:88:99"} // omit "ESI_"
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(EthernetSegmentIdentifier{
+		Type:  ESI_ARBITRARY,
+		Value: []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99},
+	}, esi)
+
+	// ESI_LACP
+	args = []string{"lacp", "aa:bb:cc:dd:ee:ff", strconv.FormatInt(0x1122, 10)} // lower case
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(EthernetSegmentIdentifier{
+		Type:  ESI_LACP,
+		Value: []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x00},
+	}, esi)
+
+	// ESI_MSTP
+	args = []string{"esi_mstp", "aa:bb:cc:dd:ee:ff", strconv.FormatInt(0x1122, 10)} // omit "ESI_" + lower case
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(EthernetSegmentIdentifier{
+		Type:  ESI_MSTP,
+		Value: []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x00},
+	}, esi)
+
+	// ESI_MAC
+	args = []string{"ESI_MAC", "aa:bb:cc:dd:ee:ff", strconv.FormatInt(0x112233, 10)}
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(EthernetSegmentIdentifier{
+		Type:  ESI_MAC,
+		Value: []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33},
+	}, esi)
+
+	// ESI_ROUTERID
+	args = []string{"ESI_ROUTERID", "1.1.1.1", strconv.FormatInt(0x11223344, 10)}
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(EthernetSegmentIdentifier{
+		Type:  ESI_ROUTERID,
+		Value: []byte{0x01, 0x01, 0x01, 0x01, 0x11, 0x22, 0x33, 0x44, 0x00},
+	}, esi)
+
+	// ESI_AS
+	args = []string{"ESI_AS", strconv.FormatInt(0xaabbccdd, 10), strconv.FormatInt(0x11223344, 10)}
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(EthernetSegmentIdentifier{
+		Type:  ESI_AS,
+		Value: []byte{0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44, 0x00},
+	}, esi)
+
+	// Other
+	args = []string{"99", "11:22:33:44:55:66:77:88:99"}
+	esi, err = ParseEthernetSegmentIdentifier(args)
+	assert.NoError(err)
+	assert.Equal(EthernetSegmentIdentifier{
+		Type:  ESIType(99),
+		Value: []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99},
+	}, esi)
+}
+
+func TestParseBogusShortData(t *testing.T) {
+	bodies := []BGPBody{
+		&BGPOpen{},
+		&BGPUpdate{},
+		&BGPNotification{},
+		&BGPRouteRefresh{},
+	}
+
+	for _, b := range bodies {
+		err := b.DecodeFromBytes([]byte{0})
+		require.Error(t, err, "expected error for %T with short data", b)
+	}
+}
+
+func TestUpdateWithdrawnRouteUnderflow(t *testing.T) {
+	// WithdrawnRoutesLen is 2, but the /32 prefix requires 5 bytes.
+	// Without an underflow guard, routelen wraps from 2 to 65533 and the
+	// loop silently consumes the entire remaining buffer as withdrawn
+	// routes, returning no error (silent data corruption).
+	const underflowed = 65533 // uint16(2 - 5)
+	buf := make([]byte, 2+5+underflowed+2)
+	buf[0], buf[1] = 0x00, 0x02                  // WithdrawnRoutesLen = 2
+	buf[2] = 0x20                                // /32 prefix length
+	buf[3], buf[4], buf[5], buf[6] = 10, 0, 0, 1 // 10.0.0.1
+	// bytes 7..65539: zeros, decoded as 65533 /0 prefixes
+	// bytes 65540..65541: TotalPathAttributeLen = 0
+
+	u := &BGPUpdate{}
+	err := u.DecodeFromBytes(buf)
+	require.Error(t, err)
+}
+
+func TestUpdatePathAttrLenUnderflow(t *testing.T) {
+	// TotalPathAttributeLen is 3, but the ORIGIN attribute is 4 bytes.
+	// Without an underflow guard, pathlen wraps from 3 to 65535 and the
+	// loop silently consumes the filler bytes as path attributes,
+	// returning no error (silent data corruption).
+	// 65535 is divisible by 3 (filler attr size), so the loop exits
+	// cleanly with pathlen=0 instead of hitting the pathlen<3 guard.
+	const underflowed = 65535 // uint16(3 - 4)
+	const fillerAttrLen = 3
+	buf := make([]byte, 2+2+4+underflowed)
+	buf[0], buf[1] = 0x00, 0x00                             // WithdrawnRoutesLen = 0
+	buf[2], buf[3] = 0x00, 0x03                             // TotalPathAttributeLen = 3
+	buf[4], buf[5], buf[6], buf[7] = 0x40, 0x01, 0x01, 0x00 // ORIGIN(IGP)
+	for i := 8; i+2 < len(buf); i += fillerAttrLen {
+		buf[i] = 0xc0   // flags: optional + transitive
+		buf[i+1] = 0xff // type: unknown
+		buf[i+2] = 0x00 // length: 0
+	}
+
+	u := &BGPUpdate{}
+	err := u.DecodeFromBytes(buf)
+	require.Error(t, err)
+}
+
+func TestCapFQDNRoundTrip(t *testing.T) {
+	tests := []struct {
+		host   string
+		domain string
+	}{
+		{"router1", "example.com"},
+		{"a", "b"},
+		{"gobgp", ""},
+		{"", "example.com"},
+	}
+	for _, tt := range tests {
+		cap := NewCapFQDN(tt.host, tt.domain)
+		buf, err := cap.Serialize()
+		require.NoError(t, err)
+
+		decoded := &CapFQDN{}
+		err = decoded.DecodeFromBytes(buf)
+		require.NoError(t, err)
+		require.Equal(t, tt.host, decoded.HostName)
+		require.Equal(t, tt.domain, decoded.DomainName)
+	}
+}
+
+func TestCapFQDNDomainNameTrailingBytes(t *testing.T) {
+	// Verify DomainName parsing respects DomainNameLen and does not
+	// consume trailing bytes beyond it.
+	cap := NewCapFQDN("router1", "example.com")
+	buf, err := cap.Serialize()
+	require.NoError(t, err)
+
+	// Append trailing garbage after the FQDN capability
+	buf = append(buf, 0xde, 0xad, 0xbe, 0xef)
+
+	decoded := &CapFQDN{}
+	err = decoded.DecodeFromBytes(buf)
+	require.NoError(t, err)
+	require.Equal(t, "example.com", decoded.DomainName)
+}
+
+func TestCapSoftwareVersionRoundTrip(t *testing.T) {
+	versions := []string{"GoBGP", "a", "BIRD 2.15.1", "FRRouting/10.2.1"}
+	for _, v := range versions {
+		cap := NewCapSoftwareVersion(v)
+		buf, err := cap.Serialize()
+		require.NoError(t, err)
+
+		decoded := &CapSoftwareVersion{}
+		err = decoded.DecodeFromBytes(buf)
+		require.NoError(t, err)
+		require.Equal(t, v, decoded.SoftwareVersion)
+		require.Equal(t, uint8(len(v)), decoded.SoftwareVersionLen)
+	}
+}
+
+func TestCapabilityBoundaryEnforcement(t *testing.T) {
+	// Each fixed-size capability must reject a CapLen that does not match the
+	// required size. Before the fix, decoders used data[2:] (the full remaining
+	// buffer) instead of the CapLen-bounded slice, allowing bytes from a
+	// following capability to be misread as the capability value.
+
+	t.Run("CapFourOctetASNumber_CapLen0_rejected", func(t *testing.T) {
+		// CapLen=0; the 4 bytes after the header belong to the next capability.
+		// Before the fix these were silently read as the AS number.
+		data := []byte{
+			byte(BGP_CAP_FOUR_OCTET_AS_NUMBER), 0x00, // code=65, CapLen=0
+			0x00, 0x00, 0xfd, 0xe8, // next cap bytes (AS 65000 in big-endian)
+		}
+		c := &CapFourOctetASNumber{}
+		require.Error(t, c.DecodeFromBytes(data))
+	})
+
+	t.Run("CapFourOctetASNumber_CapLen2_rejected", func(t *testing.T) {
+		data := []byte{byte(BGP_CAP_FOUR_OCTET_AS_NUMBER), 0x02, 0x00, 0x01}
+		c := &CapFourOctetASNumber{}
+		require.Error(t, c.DecodeFromBytes(data))
+	})
+
+	t.Run("CapFourOctetASNumber_valid", func(t *testing.T) {
+		cap := NewCapFourOctetASNumber(65000)
+		buf, err := cap.Serialize()
+		require.NoError(t, err)
+		decoded := &CapFourOctetASNumber{}
+		require.NoError(t, decoded.DecodeFromBytes(buf))
+		require.Equal(t, uint32(65000), decoded.CapValue)
+	})
+
+	t.Run("CapMultiProtocol_CapLen0_rejected", func(t *testing.T) {
+		data := []byte{
+			byte(BGP_CAP_MULTIPROTOCOL), 0x00, // CapLen=0
+			0x00, 0x01, 0x00, 0x01, // next cap bytes
+		}
+		c := &CapMultiProtocol{}
+		require.Error(t, c.DecodeFromBytes(data))
+	})
+
+	t.Run("CapMultiProtocol_CapLen2_rejected", func(t *testing.T) {
+		data := []byte{byte(BGP_CAP_MULTIPROTOCOL), 0x02, 0x00, 0x01}
+		c := &CapMultiProtocol{}
+		require.Error(t, c.DecodeFromBytes(data))
+	})
+
+	t.Run("CapMultiProtocol_valid", func(t *testing.T) {
+		cap := NewCapMultiProtocol(RF_IPv4_UC)
+		buf, err := cap.Serialize()
+		require.NoError(t, err)
+		decoded := &CapMultiProtocol{}
+		require.NoError(t, decoded.DecodeFromBytes(buf))
+		require.Equal(t, RF_IPv4_UC, decoded.CapValue)
+	})
+
+	t.Run("CapGracefulRestart_CapLen0_rejected", func(t *testing.T) {
+		data := []byte{
+			byte(BGP_CAP_GRACEFUL_RESTART), 0x00, // CapLen=0
+			0x80, 0x78, // next cap bytes (would be misread as Flags/Time)
+		}
+		c := &CapGracefulRestart{}
+		require.Error(t, c.DecodeFromBytes(data))
+	})
+
+	t.Run("CapGracefulRestart_CapLen1_rejected", func(t *testing.T) {
+		data := []byte{byte(BGP_CAP_GRACEFUL_RESTART), 0x01, 0x80}
+		c := &CapGracefulRestart{}
+		require.Error(t, c.DecodeFromBytes(data))
+	})
+
+	t.Run("CapGracefulRestart_valid", func(t *testing.T) {
+		cap := NewCapGracefulRestart(false, false, 120, []*CapGracefulRestartTuple{})
+		buf, err := cap.Serialize()
+		require.NoError(t, err)
+		decoded := &CapGracefulRestart{}
+		require.NoError(t, decoded.DecodeFromBytes(buf))
+		require.Equal(t, uint16(120), decoded.Time)
+	})
+}
+
+func TestFuzzCrashers(t *testing.T) {
+	crashers := []string{
+		"000000000000000000\x01",
+	}
+
+	for _, f := range crashers {
+		_, err := ParseBGPMessage([]byte(f))
+		require.Error(t, err, "expected error for crasher: %s", f)
+	}
+}
+
+func TestParseMessageWithBadLength(t *testing.T) {
+	type testCase struct {
+		fname string
+		data  []byte
+	}
+
+	var cases []testCase
+	root := filepath.Join("testdata", "bad-len")
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if path == root {
+				return nil
+			}
+			return filepath.SkipDir
+		}
+		fname := filepath.Base(path)
+		if strings.ContainsRune(fname, '.') {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		cases = append(cases, testCase{
+			fname: fname,
+			data:  data,
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.fname, func(t *testing.T) {
+			msg, err := ParseBGPMessage(tt.data)
+			if err == nil {
+				_, err = msg.Serialize()
+				if err != nil {
+					t.Fatal("failed to serialize:", err)
+				}
+				return
+			}
+
+			switch e := err.(type) {
+			case *MessageError:
+				switch e.TypeCode {
+				case BGP_ERROR_MESSAGE_HEADER_ERROR:
+					if e.SubTypeCode != BGP_ERROR_SUB_BAD_MESSAGE_LENGTH &&
+						e.SubTypeCode != BGP_ERROR_SUB_CONNECTION_NOT_SYNCHRONIZED {
+						t.Fatalf("got unexpected message type and data: %v", e)
+					}
+				}
+			default:
+				t.Fatalf("got unexpected error type %T: %v", err, err)
+			}
+		})
+	}
+}
+
+func TestNormalizeFlowSpecOpValues(t *testing.T) {
+	tests := []struct {
+		msg  string
+		args []string
+		want []string
+	}{
+		{
+			msg:  "valid match",
+			args: []string{"  &  <=80", " tcp  != udp ", " =!   SA   & =U!  F", " =  is-fragment+last-fragment"},
+			want: []string{"<=80", "tcp", "!=udp", "=!SA", "&=U", "!F", "=is-fragment+last-fragment"},
+		},
+		{
+			msg:  "RFC5575 trims & prefix",
+			args: []string{"&<=80"},
+			want: []string{"<=80"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.msg, func(t *testing.T) {
+			got := normalizeFlowSpecOpValues(tt.args)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_PathAttributeNextHop(t *testing.T) {
+	f := func(addr string) {
+		attr, _ := NewPathAttributeNextHop(netip.MustParseAddr(addr))
+		b, _ := attr.Serialize()
+		p := PathAttributeNextHop{}
+		err := p.DecodeFromBytes(b)
+		assert.NoError(t, err)
+		assert.Equal(t, addr, p.Value.String())
+	}
+	f("192.0.2.1")
+	f("2001:db8::68")
+}
+
+func Test_PathAttributeNextHop_InvalidLength(t *testing.T) {
+	tests := []struct {
+		name       string
+		data       []byte
+		wantErr    bool
+		errSubCode uint8
+	}{
+		{
+			name: "valid IPv4",
+			data: []byte{
+				0x40, 0x03, // Flags, Type (NEXT_HOP)
+				0x04,         // Length = 4
+				192, 0, 2, 1, // 192.0.2.1
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid IPv6",
+			data: []byte{
+				0x40, 0x03, // Flags, Type (NEXT_HOP)
+				0x10, // Length = 16
+				0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0x00, 0x68, // 2001:db8::68
+			},
+			wantErr: false,
+		},
+		{
+			name: "length 0",
+			data: []byte{
+				0x40, 0x03, // Flags, Type
+				0x00, // Length = 0
+			},
+			wantErr:    true,
+			errSubCode: BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR,
+		},
+		{
+			name: "length 1",
+			data: []byte{
+				0x40, 0x03, // Flags, Type
+				0x01, // Length = 1
+				192,  // partial data
+			},
+			wantErr:    true,
+			errSubCode: BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR,
+		},
+		{
+			name: "length 2",
+			data: []byte{
+				0x40, 0x03, // Flags, Type
+				0x02,   // Length = 2
+				192, 0, // partial data
+			},
+			wantErr:    true,
+			errSubCode: BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR,
+		},
+		{
+			name: "length 3",
+			data: []byte{
+				0x40, 0x03, // Flags, Type
+				0x03,      // Length = 3
+				192, 0, 2, // partial data
+			},
+			wantErr:    true,
+			errSubCode: BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR,
+		},
+		{
+			name: "length 5 (invalid)",
+			data: []byte{
+				0x40, 0x03, // Flags, Type
+				0x05,            // Length = 5
+				192, 0, 2, 1, 0, // 5 bytes
+			},
+			wantErr:    true,
+			errSubCode: BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR,
+		},
+		{
+			name: "length mismatch (header says 4, data is 2)",
+			data: []byte{
+				0x40, 0x03, // Flags, Type
+				0x04,   // Length = 4
+				192, 0, // only 2 bytes
+			},
+			wantErr:    true,
+			errSubCode: BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &PathAttributeNextHop{}
+			err := p.DecodeFromBytes(tt.data)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error but got none")
+					return
+				}
+				// Check error type
+				if msgErr, ok := err.(*MessageError); ok {
+					if msgErr.SubTypeCode != tt.errSubCode {
+						t.Errorf("expected error subcode %d, got %d", tt.errSubCode, msgErr.SubTypeCode)
+					}
+				} else {
+					t.Errorf("expected MessageError, got %T", err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func Test_LsTLVDecode(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in  []byte
+		t   LsTLVType
+		l   uint16
+		v   []byte
+		err bool
+	}{
+		{[]byte{0x01, 0x09, 0x00, 0x1, 0xef}, LS_TLV_IP_REACH_INFO, 5, []byte{0xef}, false},
+		{[]byte{0x01, 0x09, 0x00, 0x0}, LS_TLV_IP_REACH_INFO, 4, []byte{}, false},
+		{[]byte{0x01, 0x09, 0x01, 0xff}, LS_TLV_IP_REACH_INFO, 0, []byte{}, true},
+		{[]byte{0x01, 0x09, 0x01}, LS_TLV_L2_BUNDLE_MEMBER_TLV, 1, []byte{}, true},
+	}
+
+	for _, test := range tests {
+		tlv := &LsTLV{}
+
+		got, err := tlv.DecodeFromBytes(test.in)
+		if test.err {
+			assert.Error(err)
+			continue
+		} else {
+			assert.NoError(err)
+		}
+		assert.Equal(tlv.Len(), int(test.l))
+		assert.Equal(got, test.v)
+	}
+}
+
+func Test_LsTLVSerialize(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		tlv  LsTLV
+		val  []byte
+		want []byte
+		err  bool
+	}{
+		{LsTLV{Type: LS_TLV_SID_LABEL_TLV, Length: 2}, []byte{0x11, 0x22}, []byte{0x04, 0x89, 0x00, 0x02, 0x11, 0x22}, false},
+		{LsTLV{Type: LS_TLV_SID_LABEL_TLV, Length: 2}, []byte{0x11}, nil, true},
+		{LsTLV{Type: LS_TLV_IGP_FLAGS, Length: 0}, []byte{}, []byte{0x04, 0x80, 0x00, 0x00}, false},
+	}
+
+	for _, test := range tests {
+		got, err := test.tlv.Serialize(test.val)
+		if test.err {
+			assert.Error(err)
+		} else {
+			assert.NoError(err)
+		}
+
+		assert.Equal(got, test.want)
+	}
+}
+
+func Test_LsTLVLinkID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x01, 0x02, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02}, `{"type":258,"local_link_id":1,"remote_link_id":2}`, true, false},
+		{[]byte{0x01, 0x02, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0xFF}, `{"type":258,"local_link_id":1,"remote_link_id":2}`, false, false},
+		{[]byte{0x01, 0x02, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVLinkID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVIPv4InterfaceAddr(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x01, 0x03, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01}, `{"type":259,"ipv4_interface_address":"1.1.1.1"}`, true, false},
+		{[]byte{0x01, 0x03, 0x00, 0x04, 0x0a, 0x0a, 0x0a, 0x0a, 0x12}, `{"type":259,"ipv4_interface_address":"10.10.10.10"}`, false, false},
+		{[]byte{0x01, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIPv4InterfaceAddr{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVIPv4NeighborAddr(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x01, 0x04, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01}, `{"type":260,"ipv4_neighbor_address":"1.1.1.1"}`, true, false},
+		{[]byte{0x01, 0x04, 0x00, 0x04, 0x0a, 0x0a, 0x0a, 0x0a, 0x12}, `{"type":260,"ipv4_neighbor_address":"10.10.10.10"}`, false, false},
+		{[]byte{0x01, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIPv4NeighborAddr{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVIPv6InterfaceAddr(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x01, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF}, `{"type":261,"ipv6_interface_address":"2001:db8::beef"}`, true, false},
+		{[]byte{0x01, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, 0xFF}, `{"type":261,"ipv6_interface_address":"2001:db8::beef"}`, false, false},
+		{[]byte{0x01, 0x05, 0x00, 0x10, 0xfe, 0x80, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF}, "", false, true},
+		{[]byte{0x01, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIPv6InterfaceAddr{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVIPv6NeighborAddr(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x01, 0x06, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF}, `{"type":262,"ipv6_neighbor_address":"2001:db8::beef"}`, true, false},
+		{[]byte{0x01, 0x06, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, 0xFF}, `{"type":262,"ipv6_neighbor_address":"2001:db8::beef"}`, false, false},
+		{[]byte{0x01, 0x06, 0x00, 0x10, 0xfe, 0x81, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF}, "", false, true},
+		{[]byte{0x01, 0x06, 0x00, 0x03, 0x00, 0x00, 0x00}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIPv6NeighborAddr{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVNodeFlagBits(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x00, 0x00, 0x01, 0xFF}, `{"type":1024,"node_flags":"{Node Flags: XXVRBETO}"}`, false},
+		{[]byte{0x04, 0x00, 0x00, 0x01, 0x80}, `{"type":1024,"node_flags":"{Node Flags: *******O}"}`, false},
+		{[]byte{0x04, 0x00, 0x00, 0x01, 0x80, 0xAA}, `{"type":1024,"node_flags":"{Node Flags: *******O}"}`, false},
+		{[]byte{0x04, 0x00, 0x00, 0x02, 0x80, 0x44}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVNodeFlagBits{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVNodeName(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x02, 0x00, 0x03, 0x72, 0x74, 0x72}, `{"type":1026,"node_name":"rtr"}`, false},
+		{[]byte{0x04, 0x02, 0x00, 0x03, 0x72, 0x74, 0x72, 0x00}, `{"type":1026,"node_name":"rtr"}`, false},
+		{[]byte{0x04, 0x02, 0x00, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVNodeName{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVIsisArea(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x03, 0x00, 0x03, 0x72, 0x74, 0x72}, `{"type":1027,"isis_area_id":"[114 116 114]"}`, false},
+		{[]byte{0x04, 0x03, 0x00, 0x03, 0x72, 0x74, 0x72, 0x44}, `{"type":1027,"isis_area_id":"[114 116 114]"}`, false},
+		{[]byte{0x04, 0x03, 0x00, 0x00}, "", true},
+		{[]byte{0x04, 0x03, 0x00, 0x0E, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIsisArea{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVLocalIPv4RouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x04, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01}, `{"type":1028,"node_local_router_id_ipv4":"1.1.1.1"}`, false},
+		{[]byte{0x04, 0x04, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01, 0x12}, `{"type":1028,"node_local_router_id_ipv4":"1.1.1.1"}`, false},
+		{[]byte{0x04, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVLocalIPv4RouterID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVRemoteIPv4RouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x06, 0x00, 0x04, 0x02, 0x02, 0x02, 0x02}, `{"type":1030,"node_remote_router_id_ipv4":"2.2.2.2"}`, false},
+		{[]byte{0x04, 0x06, 0x00, 0x04, 0x02, 0x02, 0x02, 0x02, 0x44}, `{"type":1030,"node_remote_router_id_ipv4":"2.2.2.2"}`, false},
+		{[]byte{0x04, 0x06, 0x00, 0x03, 0x00, 0x00, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVRemoteIPv4RouterID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVLocalIPv6RouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF}, `{"type":1029,"node_local_router_id_ipv6":"2001:db8::beef"}`, false},
+		{[]byte{0x04, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, 0xFF}, `{"type":1029,"node_local_router_id_ipv6":"2001:db8::beef"}`, false},
+		{[]byte{0x04, 0x05, 0x00, 0x01, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVLocalIPv6RouterID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVRemoteIPv6RouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x07, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF}, `{"type":1031,"node_remote_router_id_ipv6":"2001:db8::beef"}`, false},
+		{[]byte{0x04, 0x07, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, 0xFF}, `{"type":1031,"node_remote_router_id_ipv6":"2001:db8::beef"}`, false},
+		{[]byte{0x04, 0x07, 0x00, 0x01, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVRemoteIPv6RouterID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVOpaqueNodeAttr(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x01, 0x00, 0x03, 0x01, 0x02, 0x03}, `{"type":1025,"node_opaque_attribute":"[1 2 3]"}`, false},
+		{[]byte{0x04, 0x01, 0x00, 0x03, 0x01, 0x02, 0x03, 0x04}, `{"type":1025,"node_opaque_attribute":"[1 2 3]"}`, false},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVOpaqueNodeAttr{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVAutonomousSystem(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07}, `{"type":512,"asn":117901063}`, false},
+		{[]byte{0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, 0xFF}, `{"type":512,"asn":117901063}`, false},
+		{[]byte{0x02, 0x00, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVAutonomousSystem{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVBgpLsID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07}, `{"type":513,"bgp_ls_id":117901063}`, false},
+		{[]byte{0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, 0xFF}, `{"type":513,"bgp_ls_id":117901063}`, false},
+		{[]byte{0x02, 0x01, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVBgpLsID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVIgpRouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x02, 0x03, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04}, `{"type":515,"igp_router_id":"[1 2 3 4]"}`, false},
+		{[]byte{0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}, `{"type":515,"igp_router_id":"[1 2 3 4 5 6]"}`, false},
+		{[]byte{0x02, 0x03, 0x00, 0x07, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, `{"type":515,"igp_router_id":"[1 2 3 4 5 6 7]"}`, false},
+		{[]byte{0x02, 0x03, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, `{"type":515,"igp_router_id":"[1 2 3 4 5 6 7 8]"}`, false},
+		{[]byte{0x02, 0x03, 0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIgpRouterID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVBgpRouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x02, 0x04, 0x00, 0x04, 0x0a, 0xff, 0x00, 0x01}, `{"type":516,"bgp_router_id":"10.255.0.1"}`, false},
+		{[]byte{0x02, 0x04, 0x00, 0x05, 0x0a, 0xff, 0x00, 0x01, 0x02}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVBgpRouterID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVBgpConfederationMember(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x02, 0x05, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07}, `{"type":517,"bgp_confederation_member":117901063}`, false},
+		{[]byte{0x02, 0x05, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, 0xFF}, `{"type":517,"bgp_confederation_member":117901063}`, false},
+		{[]byte{0x02, 0x05, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVBgpConfederationMember{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVOspfAreaID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07}, `{"type":514,"ospf_area_id":117901063}`, false},
+		{[]byte{0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, 0xFF}, `{"type":514,"ospf_area_id":117901063}`, false},
+		{[]byte{0x02, 0x02, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVOspfAreaID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVOspfRouteType(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x01, 0x08, 0x00, 0x01, 0x06}, `{"type":264,"ospf_route_type":"NSSA2"}`, false},
+		{[]byte{0x01, 0x08, 0x00, 0x01, 0x01, 0xFF}, `{"type":264,"ospf_route_type":"INTRA-AREA"}`, false},
+		{[]byte{0x01, 0x08, 0x00, 0x02, 0x01, 0x01}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVOspfRouteType{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVIPReachability(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x01, 0x09, 0x00, 0x02, 0x08, 0x0a}, `{"type":265,"prefix_length":8,"prefix":"[10]"}`, true, false},
+		{[]byte{0x01, 0x09, 0x00, 0x03, 0x10, 0x0a, 0x0b, 0xFF}, `{"type":265,"prefix_length":16,"prefix":"[10 11]"}`, false, false},
+		{[]byte{0x01, 0x09, 0x00, 0x01, 0x00}, `{"type":265,"prefix_length":0,"prefix":"[]"}`, true, false},
+		{[]byte{0x01, 0x09, 0x00, 0x02, 0x08}, ``, false, true},
+		{[]byte{0x01, 0x09, 0x00, 0x01, 0x01}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIPReachability{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVIPReachabilityToIPNet(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		tlv  LsTLVIPReachability
+		ipv6 bool
+		want net.IPNet
+	}{
+		{
+			tlv: LsTLVIPReachability{
+				PrefixLength: 8,
+				Prefix:       []byte{0x0a},
+			},
+			ipv6: false,
+			want: net.IPNet{
+				IP:   net.IPv4(10, 0, 0, 0),
+				Mask: net.CIDRMask(8, 32),
+			},
+		},
+		{
+			tlv: LsTLVIPReachability{
+				PrefixLength: 4,
+				Prefix:       []byte{0xaa},
+			},
+			ipv6: false,
+			want: net.IPNet{
+				IP:   net.IPv4(160, 0, 0, 0),
+				Mask: net.CIDRMask(4, 32),
+			},
+		},
+		{
+			tlv: LsTLVIPReachability{
+				PrefixLength: 31,
+				Prefix:       []byte{0x0a, 0x0a, 0x0a, 0xfe},
+			},
+			ipv6: false,
+			want: net.IPNet{
+				IP:   net.IPv4(10, 10, 10, 254),
+				Mask: net.CIDRMask(31, 32),
+			},
+		},
+		{
+			tlv: LsTLVIPReachability{
+				PrefixLength: 16,
+				Prefix:       []byte{0x20, 0x01},
+			},
+			ipv6: true,
+			want: net.IPNet{
+				IP:   net.ParseIP("2001::"),
+				Mask: net.CIDRMask(16, 128),
+			},
+		},
+		{
+			tlv: LsTLVIPReachability{
+				PrefixLength: 24,
+				Prefix:       []byte{0x20, 0x01, 0x0d},
+			},
+			ipv6: true,
+			want: net.IPNet{
+				IP:   net.ParseIP("2001:d00::"),
+				Mask: net.CIDRMask(24, 128),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		got := test.tlv.toPrefix(test.ipv6)
+		assert.Equal(test.want.IP.String(), got.Addr().String())
+		assert.Equal(test.want.Mask.String(), net.CIDRMask(got.Bits(), got.Addr().BitLen()).String())
+	}
+}
+
+func Test_LsTLVAdminGroup(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x40, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07}, `{"type":1088,"admin_group":"07070707"}`, false},
+		{[]byte{0x04, 0x40, 0x00, 0x04, 0xAE, 0xAE, 0xAE, 0xAE, 0xFF}, `{"type":1088,"admin_group":"aeaeaeae"}`, false},
+		{[]byte{0x04, 0x40, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVAdminGroup{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVMaxLinkBw(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x41, 0x00, 0x04, 0x43, 0xA4, 0xB2, 0x00}, `{"type":1089,"max_link_bw":329.39062}`, false},
+		{[]byte{0x04, 0x41, 0x00, 0x04, 0x43, 0xA4, 0xB2, 0x00, 0xFF}, `{"type":1089,"max_link_bw":329.39062}`, false},
+		{[]byte{0x04, 0x41, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0x04, 0x41, 0x00, 0x04, 0x7f, 0x80, 0x00, 0x00}, "", true}, // +Inf
+		{[]byte{0x04, 0x41, 0x00, 0x04, 0xff, 0x80, 0x00, 0x00}, "", true}, // -Inf
+		{[]byte{0x04, 0x41, 0x00, 0x04, 0xff, 0xbf, 0xff, 0xff}, "", true}, // NaN
+		{[]byte{0x04, 0x41, 0x00, 0x04, 0xc2, 0xc8, 0x00, 0x00}, "", true}, // -100
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVMaxLinkBw{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVMaxReservableLinkBw(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x42, 0x00, 0x04, 0x43, 0xA4, 0xB2, 0x00}, `{"type":1090,"max_reservable_link_bw":329.39062}`, false},
+		{[]byte{0x04, 0x42, 0x00, 0x04, 0x43, 0xA4, 0xB2, 0x00, 0xFF}, `{"type":1090,"max_reservable_link_bw":329.39062}`, false},
+		{[]byte{0x04, 0x42, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0x04, 0x42, 0x00, 0x04, 0x7f, 0x80, 0x00, 0x00}, "", true}, // +Inf
+		{[]byte{0x04, 0x42, 0x00, 0x04, 0xff, 0x80, 0x00, 0x00}, "", true}, // -Inf
+		{[]byte{0x04, 0x42, 0x00, 0x04, 0xff, 0xbf, 0xff, 0xff}, "", true}, // NaN
+		{[]byte{0x04, 0x42, 0x00, 0x04, 0xc2, 0xc8, 0x00, 0x00}, "", true}, // -100
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVMaxReservableLinkBw{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVUnreservedBw(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{
+			[]byte{
+				0x04, 0x43, 0x00, 0x20,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB3, 0x00,
+			},
+			`{"type":1091,"unreserved_bw":[329.39062,329.39062,329.39062,329.39062,329.39062,329.39062,329.39062,329.39844]}`, false,
+		},
+		{
+			[]byte{
+				0x04, 0x43, 0x00, 0x20,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00, 0xff,
+			},
+			`{"type":1091,"unreserved_bw":[329.39062,329.39062,329.39062,329.39062,329.39062,329.39062,329.39062,329.39062]}`, false,
+		},
+		{
+			[]byte{
+				0x04, 0x43, 0x00, 0x20,
+				0x7f, 0x80, 0x00, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB3, 0x00,
+			},
+			"", true,
+		},
+		{
+			[]byte{
+				0x04, 0x43, 0x00, 0x20,
+				0xff, 0x80, 0x00, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB3, 0x00,
+			},
+			"", true,
+		},
+		{
+			[]byte{
+				0x04, 0x43, 0x00, 0x20,
+				0x43, 0xA4, 0xB3, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0xff, 0xbf, 0xff, 0xff,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB3, 0x00,
+			},
+			"", true,
+		},
+		{
+			[]byte{
+				0x04, 0x43, 0x00, 0x20,
+				0x43, 0xA4, 0xB3, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB3, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0x43, 0xA4, 0xB2, 0x00,
+				0xc2, 0xc8, 0x00, 0x00,
+			},
+			"", true,
+		},
+		{[]byte{0x04, 0x43, 0x00, 0x03, 0x07, 0x07, 0x07}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVUnreservedBw{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVTEDefaultMetric(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x44, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07}, `{"type":1092,"te_default_metric":117901063}`, true, false},
+		{[]byte{0x04, 0x44, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, 0xFF}, `{"type":1092,"te_default_metric":117901063}`, false, false},
+		{[]byte{0x04, 0x44, 0x00, 0x03, 0x07, 0x07, 0x07}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVTEDefaultMetric{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			got, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, got)
+		}
+	}
+}
+
+func Test_LsTLVUnidirectionalLinkDelay(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x5a, 0x00, 0x04, 0x00, 0x00, 0x21, 0x44}, `{"type":1114,"flags":0,"unidirectional_link_delay":8516}`, true, false},
+		{[]byte{0x04, 0x5a, 0x00, 0x04, 0x80, 0xff, 0xff, 0xff}, `{"type":1114,"flags":128,"unidirectional_link_delay":16777215}`, true, false},
+		{[]byte{0x04, 0x5a, 0x00, 0x03, 0x00, 0x21, 0x44}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVUnidirectionalLinkDelay{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			got, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, got)
+		}
+	}
+}
+
+func Test_LsTLVUnidirectionalLinkDelaySerializeMasksUndefinedFlagBits(t *testing.T) {
+	assert := assert.New(t)
+
+	tlv := LsTLVUnidirectionalLinkDelay{
+		LsTLV: LsTLV{
+			Type:   LS_TLV_UNIDIRECTIONAL_LINK_DELAY,
+			Length: 4,
+		},
+		Flags: 0xff,
+		Delay: 0x123456,
+	}
+
+	got, err := tlv.Serialize()
+	assert.NoError(err)
+	assert.Equal([]byte{0x04, 0x5a, 0x00, 0x04, 0x80, 0x12, 0x34, 0x56}, got)
+}
+
+func Test_LsTLVMinMaxUnidirectionalLinkDelay(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x5b, 0x00, 0x08, 0x00, 0x00, 0x21, 0x3f, 0x00, 0x00, 0x21, 0x4f}, `{"type":1115,"flags":0,"min_unidirectional_link_delay":8511,"max_unidirectional_link_delay":8527}`, true, false},
+		{[]byte{0x04, 0x5b, 0x00, 0x08, 0x80, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0xff}, `{"type":1115,"flags":128,"min_unidirectional_link_delay":16777214,"max_unidirectional_link_delay":16777215}`, false, false},
+		{[]byte{0x04, 0x5b, 0x00, 0x07, 0x00, 0x00, 0x21, 0x3f, 0x00, 0x21, 0x4f}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVMinMaxUnidirectionalLinkDelay{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			got, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, got)
+		}
+	}
+}
+
+func Test_LsTLVMinMaxUnidirectionalLinkDelaySerializeMasksUndefinedFlagBits(t *testing.T) {
+	assert := assert.New(t)
+
+	tlv := LsTLVMinMaxUnidirectionalLinkDelay{
+		LsTLV: LsTLV{
+			Type:   LS_TLV_MIN_MAX_UNIDIRECTIONAL_LINK_DELAY,
+			Length: 8,
+		},
+		Flags:    0xff,
+		MinDelay: 0x000001,
+		Reserved: 0xff,
+		MaxDelay: 0x000002,
+	}
+
+	got, err := tlv.Serialize()
+	assert.NoError(err)
+	assert.Equal([]byte{0x04, 0x5b, 0x00, 0x08, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02}, got)
+}
+
+func Test_LsTLVUnidirectionalDelayVariation(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x5c, 0x00, 0x04, 0x00, 0x00, 0x00, 0x33}, `{"type":1116,"unidirectional_delay_variation":51}`, true, false},
+		{[]byte{0x04, 0x5c, 0x00, 0x04, 0xff, 0xff, 0xff, 0xff}, `{"type":1116,"unidirectional_delay_variation":16777215}`, false, false},
+		{[]byte{0x04, 0x5c, 0x00, 0x03, 0x00, 0x00, 0x33}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVUnidirectionalDelayVariation{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			got, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, got)
+		}
+	}
+}
+
+func Test_LsTLVIGPMetric(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x47, 0x00, 0x01, 0x01}, `{"type":1095,"igp_metric":1}`, true, false},
+		{[]byte{0x04, 0x47, 0x00, 0x01, 0x3F}, `{"type":1095,"igp_metric":63}`, true, false},
+		{[]byte{0x04, 0x47, 0x00, 0x01, 0xFF}, `{"type":1095,"igp_metric":63}`, false, false},
+		{[]byte{0x04, 0x47, 0x00, 0x02, 0x00, 0x01}, `{"type":1095,"igp_metric":1}`, true, false},
+		{[]byte{0x04, 0x47, 0x00, 0x02, 0xff, 0xff}, `{"type":1095,"igp_metric":65535}`, true, false},
+		{[]byte{0x04, 0x47, 0x00, 0x03, 0x00, 0x00, 0x01}, `{"type":1095,"igp_metric":1}`, true, false},
+		{[]byte{0x04, 0x47, 0x00, 0x03, 0xff, 0xff, 0xff}, `{"type":1095,"igp_metric":16777215}`, true, false},
+		{[]byte{0x04, 0x47, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIGPMetric{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			got, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, got)
+		}
+	}
+}
+
+func Test_LsTLVNLinkName(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x4a, 0x00, 0x03, 0x72, 0x74, 0x72}, `{"type":1098,"link_name":"rtr"}`, false},
+		{[]byte{0x04, 0x4a, 0x00, 0x03, 0x72, 0x74, 0x72, 0x00}, `{"type":1098,"link_name":"rtr"}`, false},
+		{[]byte{0x04, 0x4a, 0x00, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVLinkName{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVSrAlgorithm(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x0b, 0x00, 0x03, 0x01, 0x02, 0x03}, `{"type":1035,"sr_algorithm":"[1 2 3]"}`, false},
+		{[]byte{0x04, 0x0b, 0x00, 0x03, 0x01, 0x02, 0x03, 0x04}, `{"type":1035,"sr_algorithm":"[1 2 3]"}`, false},
+		{[]byte{0x04, 0x0b, 0x00, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVSrAlgorithm{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVSrCapabilities(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{
+			[]byte{
+				0x04, 0x0a, 0x00, 0x0c, // type 1034, length 12
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+			},
+			`{"type":1034,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":100500}}]}`,
+			true,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0a, 0x00, 0x0d, // type 1034, length 13
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+			},
+			`{"type":1034,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":71005001}}]}`,
+			true,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0a, 0x00, 0x17, // type 1034, length 23
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+				0x0f, 0x42, 0x40, // range: 1000000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+			},
+			`{"type":1034,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":71005001}},{"Range":1000000,"FirstLabel":{"type":1161,"sid_label":100500}}]}`,
+			true,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0a, 0x00, 0x17, // type 1034, length 23
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+				0x0f, 0x42, 0x40, // range: 1000000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+				0xff, 0xff, 0xff, // some random bytes - should be ignored
+			},
+			`{"type":1034,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":71005001}},{"Range":1000000,"FirstLabel":{"type":1161,"sid_label":100500}}]}`,
+			false,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0a, 0x00, 0xcc, // type 1034, length 204 (corrupted)
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+			},
+			"",
+			false,
+			true,
+		},
+		{
+			[]byte{
+				0x04, 0x0a, 0x00, 0x11, // type 1034, length 23
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+				0x0f, 0x42, 0x40, // range: 1000000
+				0x04, // No SID/Label sub-TLV
+			},
+			"",
+			false,
+			true,
+		},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVSrCapabilities{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVSrCapabilitiesFlagBits(t *testing.T) {
+	assert := assert.New(t)
+
+	tlv := NewLsTLVSrCapabilities(&LsSrCapabilities{
+		IPv4Supported: true,
+		IPv6Supported: true,
+	})
+	assert.Equal(uint8(0xC0), tlv.Flags)
+
+	caps := (&LsTLVSrCapabilities{Flags: 0xC0}).Extract()
+	assert.True(caps.IPv4Supported)
+	assert.True(caps.IPv6Supported)
+}
+
+func Test_LsTLVLocalBlock(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{
+			[]byte{
+				0x04, 0x0c, 0x00, 0x0c, // type 1036, length 12
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+			},
+			`{"type":1036,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":100500}}]}`,
+			true,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0c, 0x00, 0x0d, // type 1036, length 13
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+			},
+			`{"type":1036,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":71005001}}]}`,
+			true,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0c, 0x00, 0x17, // type 1036, length 23
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+				0x0f, 0x42, 0x40, // range: 1000000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+			},
+			`{"type":1036,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":71005001}},{"Range":1000000,"FirstLabel":{"type":1161,"sid_label":100500}}]}`,
+			true,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0c, 0x00, 0x17, // type 1036, length 23
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+				0x0f, 0x42, 0x40, // range: 1000000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+				0xff, 0xff, 0xff, // some random bytes - should be ignored
+			},
+			`{"type":1036,"flags":0,"ranges":[{"Range":35000,"FirstLabel":{"type":1161,"sid_label":71005001}},{"Range":1000000,"FirstLabel":{"type":1161,"sid_label":100500}}]}`,
+			false,
+			false,
+		},
+		{
+			[]byte{
+				0x04, 0x0c, 0x00, 0xcc, // type 1036, length 204 (corrupted)
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // SID/Label TLV, SID: 100500
+			},
+			"",
+			false,
+			true,
+		},
+		{
+			[]byte{
+				0x04, 0x0c, 0x00, 0x11, // type 1036, length 23
+				0x00, 0x00, // flags and reserved
+				0x00, 0x88, 0xb8, // range: 35000
+				0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49, // SID/Label TLV, SID: 71005001
+				0x0f, 0x42, 0x40, // range: 1000000
+				0x04, // No SID/Label sub-TLV
+			},
+			"",
+			false,
+			true,
+		},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVSrLocalBlock{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVAdjacencySID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x4b, 0x00, 0x07, 0x01, 0x01, 0x00, 0x00, 0x01, 0x88, 0x94}, `{"type":1099,"adjacency_sid":100500}`, true, false},
+		{[]byte{0x04, 0x4b, 0x00, 0x07, 0x01, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff}, `{"type":1099,"adjacency_sid":1048575}`, false, false},
+		{[]byte{0x04, 0x4b, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x04, 0x3B, 0x73, 0x49}, `{"type":1099,"adjacency_sid":71005001}`, true, false},
+		{[]byte{0x04, 0x4b, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x11}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x07, 0x04, 0x3B, 0x73, 0x49, 0x05, 0x06, 0x07}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVAdjacencySID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVSIDLabel(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94}, `{"type":1161,"sid_label":100500}`, true, false},
+		{[]byte{0x04, 0x89, 0x00, 0x03, 0x0f, 0xff, 0xff}, `{"type":1161,"sid_label":1048575}`, true, false},
+		{[]byte{0x04, 0x89, 0x00, 0x03, 0xff, 0xff, 0xff}, `{"type":1161,"sid_label":1048575}`, false, false},
+		{[]byte{0x04, 0x89, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49}, `{"type":1161,"sid_label":71005001}`, false, false},
+		{[]byte{0x04, 0x89, 0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x04, 0x04, 0x3B, 0x73, 0x49}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVSIDLabel{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVPrefixSID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x86, 0x00, 0x07, 0x01, 0x01, 0x00, 0x00, 0x01, 0x88, 0x94}, `{"type":1158,"prefix_sid":100500}`, true, false},
+		{[]byte{0x04, 0x86, 0x00, 0x07, 0x01, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff}, `{"type":1158,"prefix_sid":1048575}`, false, false},
+		{[]byte{0x04, 0x86, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x04, 0x3B, 0x73, 0x49}, `{"type":1158,"prefix_sid":71005001}`, true, false},
+		{[]byte{0x04, 0x86, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x11}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x07, 0x04, 0x3B, 0x73, 0x49, 0x05, 0x06, 0x07}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVPrefixSID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVPeerNodeSID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x4d, 0x00, 0x07, 0xc0, 0x00, 0x00, 0x00, 0x01, 0x88, 0x94}, `{"type":1101,"peer_node_sid":100500}`, true, false},
+		{[]byte{0x04, 0x4d, 0x00, 0x07, 0xc0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff}, `{"type":1101,"peer_node_sid":1048575}`, false, false},
+		{[]byte{0x04, 0x4d, 0x00, 0x08, 0xc0, 0x00, 0x00, 0x00, 0x04, 0x3B, 0x73, 0x49}, `{"type":1101,"peer_node_sid":71005001}`, true, false},
+		{[]byte{0x04, 0x4d, 0x00, 0x06, 0xc0, 0x02, 0x03, 0x04, 0x05, 0x11}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x07, 0x04, 0x3B, 0x73, 0x49, 0x05, 0x06, 0x07}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVPeerNodeSID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVPeerAdjacencySID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x4e, 0x00, 0x07, 0xc0, 0x00, 0x00, 0x00, 0x01, 0x88, 0x94}, `{"type":1102,"peer_adjacency_sid":100500}`, true, false},
+		{[]byte{0x04, 0x4e, 0x00, 0x07, 0xc0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff}, `{"type":1102,"peer_adjacency_sid":1048575}`, false, false},
+		{[]byte{0x04, 0x4e, 0x00, 0x08, 0xc0, 0x00, 0x00, 0x00, 0x04, 0x3B, 0x73, 0x49}, `{"type":1102,"peer_adjacency_sid":71005001}`, true, false},
+		{[]byte{0x04, 0x4e, 0x00, 0x06, 0xc0, 0x02, 0x03, 0x04, 0x05, 0x11}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x07, 0x04, 0x3B, 0x73, 0x49, 0x05, 0x06, 0x07}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVPeerAdjacencySID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVPeerSetSID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x4f, 0x00, 0x07, 0xc0, 0x00, 0x00, 0x00, 0x01, 0x88, 0x94}, `{"type":1103,"peer_set_sid":100500}`, true, false},
+		{[]byte{0x04, 0x4f, 0x00, 0x07, 0xc0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff}, `{"type":1103,"peer_set_sid":1048575}`, false, false},
+		{[]byte{0x04, 0x4f, 0x00, 0x08, 0xc0, 0x00, 0x00, 0x00, 0x04, 0x3B, 0x73, 0x49}, `{"type":1103,"peer_set_sid":71005001}`, true, false},
+		{[]byte{0x04, 0x4f, 0x00, 0x06, 0xc0, 0x02, 0x03, 0x04, 0x05, 0x11}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x07, 0x04, 0x3B, 0x73, 0x49, 0x05, 0x06, 0x07}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVPeerSetSID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+
+		if test.serialize {
+			s, err := tlv.Serialize()
+			assert.NoError(err)
+			assert.Equal(test.in, s)
+		}
+	}
+}
+
+func Test_LsTLVSourceRouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x93, 0x00, 0x04, 0x0a, 0x0a, 0x0a, 0x0a}, `{"type":1171,"source_router_id":"10.10.10.10"}`, false},
+		{[]byte{0x04, 0x93, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF}, `{"type":1171,"source_router_id":"2001:db8::beef"}`, false},
+		{[]byte{0x04, 0x93, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, 0xFF}, `{"type":1171,"source_router_id":"2001:db8::beef"}`, false},
+		{[]byte{0x04, 0x93, 0x00, 0x01, 0x00}, "", true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVSourceRouterID{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVOpaqueLinkAttr(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x49, 0x00, 0x03, 0x01, 0x02, 0x03}, `{"type":1097,"link_opaque_attribute":"[1 2 3]"}`, false},
+		{[]byte{0x04, 0x49, 0x00, 0x03, 0x01, 0x02, 0x03, 0x04}, `{"type":1097,"link_opaque_attribute":"[1 2 3]"}`, false},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVOpaqueLinkAttr{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_LsTLVIGPFlags(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		want      string
+		serialize bool
+		err       bool
+	}{
+		{[]byte{0x04, 0x80, 0x00, 0x01, 0xFF}, `{"type":1152,"igp_flags":"{IGP Flags: XXXXPLND}"}`, true, false},
+		{[]byte{0x04, 0x80, 0x00, 0x01, 0x80}, `{"type":1152,"igp_flags":"{IGP Flags: *******D}"}`, true, false},
+		{[]byte{0x04, 0x80, 0x00, 0x01, 0x80, 0xAA}, `{"type":1152,"igp_flags":"{IGP Flags: *******D}"}`, false, false},
+		{[]byte{0x04, 0x80, 0x00, 0x02, 0x80, 0x44}, "", false, true},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", false, true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVIGPFlags{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+			got, err := tlv.MarshalJSON()
+			assert.NoError(err)
+			assert.Equal(got, []byte(test.want))
+			if test.serialize {
+				got, err := tlv.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_LsTLVIGPFlagsFlagBits(t *testing.T) {
+	assert := assert.New(t)
+
+	tlv := NewLsTLVIGPFlags(&LsIGPFlags{
+		Down:          true,
+		NoUnicast:     true,
+		LocalAddress:  true,
+		PropagateNSSA: true,
+	})
+	assert.Equal(uint8(0xF0), tlv.Flags)
+
+	flags := (&LsTLVIGPFlags{Flags: 0xF0}).Extract()
+	assert.True(flags.Down)
+	assert.True(flags.NoUnicast)
+	assert.True(flags.LocalAddress)
+	assert.True(flags.PropagateNSSA)
+}
+
+func Test_LsTLVConstructorsUseLsTLVTypes(t *testing.T) {
+	assert := assert.New(t)
+
+	nodeOpaque := []byte{0x01}
+	assert.EqualValues(LS_TLV_OPAQUE_NODE_ATTR, NewLsTLVOpaqueNodeAttr(&nodeOpaque).Type)
+
+	adminGroup := uint32(0x01020304)
+	assert.EqualValues(LS_TLV_ADMIN_GROUP, NewLsTLVAdminGroup(&adminGroup).Type)
+
+	srCaps := NewLsTLVSrCapabilities(&LsSrCapabilities{
+		IPv4Supported: true,
+		Ranges: []LsSrRange{
+			{
+				Begin: 100500,
+				End:   135500,
+			},
+		},
+	})
+	assert.EqualValues(LS_TLV_SR_CAPABILITIES, srCaps.Type)
+	if assert.Len(srCaps.Ranges, 1) {
+		assert.EqualValues(LS_TLV_SID_LABEL_TLV, srCaps.Ranges[0].FirstLabel.Type)
+	}
+
+	srLocalBlock := NewLsTLVSrLocalBlock(&LsSrLocalBlock{
+		Ranges: []LsSrRange{
+			{
+				Begin: 160000,
+				End:   170000,
+			},
+		},
+	})
+	assert.EqualValues(LS_TLV_SR_LOCAL_BLOCK, srLocalBlock.Type)
+	if assert.Len(srLocalBlock.Ranges, 1) {
+		assert.EqualValues(LS_TLV_SID_LABEL_TLV, srLocalBlock.Ranges[0].FirstLabel.Type)
+	}
+
+	prefixSID := uint32(16000)
+	assert.EqualValues(LS_TLV_PREFIX_SID, NewLsTLVPrefixSID(&prefixSID).Type)
+
+	linkOpaque := []byte{0x02}
+	assert.EqualValues(LS_TLV_OPAQUE_LINK_ATTR, NewLsTLVOpaqueLinkAttr(&linkOpaque).Type)
+
+	srlgs := []uint32{100, 200}
+	assert.EqualValues(LS_TLV_SRLG, NewLsTLVSrlg(&srlgs).Type)
+
+	igpFlags := &LsIGPFlags{Down: true}
+	assert.EqualValues(LS_TLV_IGP_FLAGS, NewLsTLVIGPFlags(igpFlags).Type)
+
+	prefixOpaque := []byte{0x03, 0x04}
+	assert.EqualValues(LS_TLV_OPAQUE_PREFIX_ATTR, NewLsTLVOpaquePrefixAttr(&prefixOpaque).Type)
+}
+
+func Test_LsTLVOpaquePrefixAttr(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in   []byte
+		want string
+		err  bool
+	}{
+		{[]byte{0x04, 0x85, 0x00, 0x03, 0x01, 0x02, 0x03}, `{"type":1157,"prefix_opaque_attribute":"[1 2 3]"}`, false},
+		{[]byte{0x04, 0x85, 0x00, 0x03, 0x01, 0x02, 0x03, 0x04}, `{"type":1157,"prefix_opaque_attribute":"[1 2 3]"}`, false},
+		{[]byte{0xfe, 0xfe, 0x00, 0x00}, "", true},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVOpaquePrefixAttr{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+			continue
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+		}
+
+		got, err := tlv.MarshalJSON()
+		assert.NoError(err)
+		assert.Equal(got, []byte(test.want))
+	}
+}
+
+func Test_parseIGPRouterID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in     []byte
+		str    string
+		pseudo bool
+	}{
+		{[]byte{1, 2, 3, 4}, "1.2.3.4", false},
+		{[]byte{1, 2, 3, 4, 5, 255}, "0102.0304.05ff", false},
+		{[]byte{1, 2, 3, 4, 5, 255, 0}, "0102.0304.05ff-00", true},
+		{[]byte{1, 2, 3, 4, 5, 6, 7, 8}, "1.2.3.4:5.6.7.8", true},
+	}
+
+	for _, test := range tests {
+		str, pseudo := parseIGPRouterID(test.in)
+		assert.Equal(test.str, str)
+		assert.Equal(test.pseudo, pseudo)
+	}
+}
+
+func Test_LsNodeDescriptor(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{
+			[]byte{
+				0x01, 0x00, 0x00, 0x22, // Local Node Desc
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+				0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			},
+			"{ASN: 117901063, BGP LS ID: 117901063, OSPF AREA: 117901063, IGP ROUTER ID: 0102.0304.0506}",
+			false, true,
+		},
+		{
+			[]byte{
+				0x01, 0x01, 0x00, 0x22, // Remote Node Desc
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+				0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			},
+			"{ASN: 117901063, BGP LS ID: 117901063, OSPF AREA: 117901063, IGP ROUTER ID: 0102.0304.0506}",
+			false, true,
+		},
+		{[]byte{
+			0x01, 0x00, 0x00, 0x21, // Truncated Length
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+		}, "", true, false},
+		{[]byte{
+			0x01, 0x00, 0x00, 0x22, // Missing mandatory TLV
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+		}, "", true, false},
+		{[]byte{
+			0x01, 0x00, 0x00, 0x22, // Incorrect TLV order
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+		}, "", true, false},
+		{
+			[]byte{
+				0x01, 0x00, 0x00, 0x26, // Unexpected TLV
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+				0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				0xfe, 0x01, 0x00, 0x00, // Unsupported
+			},
+			"{ASN: 117901063, BGP LS ID: 117901063, OSPF AREA: 117901063, IGP ROUTER ID: 0102.0304.0506}",
+			false, false,
+		},
+		{[]byte{
+			0x01, 0x00, 0x00, 0x0a, // Missing optional TLVs
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+		}, "{ASN: 0, BGP LS ID: 0, OSPF AREA: 0, IGP ROUTER ID: 0102.0304.0506}", false, true},
+		{
+			[]byte{
+				0x01, 0x01, 0x00, 0x20, // Remote Node Desc
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+				0x02, 0x04, 0x00, 0x04, 0x0a, 0xff, 0x00, 0x01, // TLV BGP ROUTER ID: "10.255.0.1"
+				0x02, 0x05, 0x00, 0x04, 0x07, 0x07, 0x07, 0x08, // TLV BGP CONFEDERATION MEMBER: 117901064
+			},
+			"{ASN: 117901063, BGP LS ID: 117901063, BGP ROUTER ID: 10.255.0.1}",
+			false, true,
+		},
+	}
+
+	for _, test := range tests {
+		tlv := LsTLVNodeDescriptor{}
+		if test.err {
+			assert.Error(tlv.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(tlv.DecodeFromBytes(test.in))
+			assert.Equal(test.str, tlv.String())
+			if test.serialize {
+				got, err := tlv.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_LsProtocolIDString(t *testing.T) {
+	assert.Equal(t, "BGP", LsProtocolID(LS_PROTOCOL_BGP).String())
+	assert.Equal(t, "RSVP-TE", LsProtocolID(LS_PROTOCOL_RSVP_TE).String())
+	assert.Equal(t, "SR", LsProtocolID(LS_PROTOCOL_SEGMENT_ROUTING).String())
+	assert.EqualValues(t, 9, LS_PROTOCOL_SEGMENT_ROUTING)
+	assert.Equal(t, "LsProtocolID(10)", LsProtocolID(10).String())
+}
+
+func Test_LsTLVSerializeLength(t *testing.T) {
+	v4 := netip.MustParseAddr("10.0.0.1")
+	v6 := netip.MustParseAddr("2001:db8::1")
+
+	b, err := NewLsTLVLocalIPv4RouterID(&v4).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+4)
+
+	b, err = NewLsTLVRemoteIPv4RouterID(&v4).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+4)
+
+	b, err = NewLsTLVLocalIPv6RouterID(&v6).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+16)
+
+	b, err = NewLsTLVRemoteIPv6RouterID(&v6).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+16)
+
+	sid := uint32(1000002)
+	b, err = NewLsTLVPrefixSID(&sid).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+8)
+
+	attr := []byte{0xde, 0xad, 0xbe, 0xef}
+	b, err = NewLsTLVOpaquePrefixAttr(&attr).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+len(attr))
+
+	// Flags (1) + Reserved (1), then per range the Range Size (3) and a
+	// SID/Label sub-TLV carrying a 4-octet label.
+	rangeLen := 3 + tlvHdrLen + 4
+
+	caps := &LsSrCapabilities{
+		IPv4Supported: true,
+		Ranges:        []LsSrRange{{Begin: 100, End: 200}, {Begin: 1000, End: 1100}},
+	}
+	b, err = NewLsTLVSrCapabilities(caps).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+2+2*rangeLen)
+	decodedCaps := &LsTLVSrCapabilities{}
+	assert.NoError(t, decodedCaps.DecodeFromBytes(b))
+	assert.Len(t, decodedCaps.Ranges, 2)
+
+	block := &LsSrLocalBlock{
+		Ranges: []LsSrRange{{Begin: 100, End: 200}},
+	}
+	b, err = NewLsTLVSrLocalBlock(block).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+2+rangeLen)
+	decodedBlock := &LsTLVSrLocalBlock{}
+	assert.NoError(t, decodedBlock.DecodeFromBytes(b))
+	assert.Len(t, decodedBlock.Ranges, 1)
+}
+
+func Test_LsAddrPrefix(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{[]byte{
+			0x00, 0x01, 0x00, 0x2f, // Node NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+		}, "NLRI { NODE { AS:117901063 BGP-LS ID:117901063 0102.0304.0506 ISIS-L2:0 } }", false, true},
+		{[]byte{
+			0x00, 0x01, 0x00, 0x2e, // Node NLRI, truncated length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, // TLV IGP Router ID: 0102.0304.05
+		}, "", true, false},
+		{[]byte{
+			0x00, 0x01, 0x00, 0x2f, // Node NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x01, 0x00, 0x22, // Remote Node Desc (unexpected)
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+		}, "", true, false},
+		{[]byte{
+			0x00, 0x01, 0x00, 0x2d, // Node NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			// Mandatory TLV missing
+		}, "", true, false},
+		{[]byte{
+			0x00, 0x02, 0x00, 0x61, // Link NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x01, 0x00, 0x22, // Remote Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // TLV IGP Router ID: 0605.0403.0201
+			0x01, 0x02, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, // LinkID TLV, Local: 1, Remote: 2
+		}, "NLRI { LINK { LOCAL_NODE: 0102.0304.0506 REMOTE_NODE: 0605.0403.0201 LINK: 1->2 ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x02, 0x00, 0x65, // Link NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x01, 0x00, 0x22, // Remote Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // TLV IGP Router ID: 0605.0403.0201
+			0x01, 0x03, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01, // IPv4 Interface Addr TLV: 1.1.1.1
+			0x01, 0x04, 0x00, 0x04, 0x02, 0x02, 0x02, 0x02, // IPv4 Neighbor Addr TLV: 2.2.2.2
+		}, "NLRI { LINK { LOCAL_NODE: 0102.0304.0506 REMOTE_NODE: 0605.0403.0201 LINK: 1.1.1.1->2.2.2.2 ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x02, 0x00, 0x7d, // Link NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x01, 0x00, 0x22, // Remote Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // TLV IGP Router ID: 0605.0403.0201
+			0x01, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, // IPv6 Interface Addr TLV: 2001:db8::beef
+			0x01, 0x06, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xAD, // IPv6 Interface Addr TLV: 2001:db8::dead
+		}, "NLRI { LINK { LOCAL_NODE: 0102.0304.0506 REMOTE_NODE: 0605.0403.0201 LINK: 2001:db8::beef->2001:db8::dead ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x02, 0x00, 0x55, // Link NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x01, 0x00, 0x22, // Remote Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // TLV IGP Router ID: 0605.0403.0201
+		}, "NLRI { LINK { LOCAL_NODE: 0102.0304.0506 REMOTE_NODE: 0605.0403.0201 LINK: UNKNOWN ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x02, 0x00, 0x2f, // Link NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			// Missing mandatory TLV
+		}, "", true, false},
+		{[]byte{
+			0x00, 0x03, 0x00, 0x35, // Prefix IPv4 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x09, 0x00, 0x02, 0x08, 0x0a, // IP ReachabilityInfo TLV, 10.0.0.0/8
+		}, "NLRI { PREFIXv4 { LOCAL_NODE: 0102.0304.0506 PREFIX: [10.0.0.0/8]  ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x03, 0x00, 0x43, // Prefix IPv4 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x09, 0x00, 0x02, 0x08, 0x0a, // IP ReachabilityInfo TLV, 10.0.0.0/8
+			0x01, 0x09, 0x00, 0x05, 0x1f, 0xc0, 0xa8, 0x07, 0xfe, // IP ReachabilityInfo TLV, 192.168.7.254/31
+			0x01, 0x08, 0x00, 0x01, 0x06, // OSPF Route Type TLV (NSSA2)
+		}, "NLRI { PREFIXv4 { LOCAL_NODE: 0102.0304.0506 PREFIX: [10.0.0.0/8 192.168.7.254/31] OSPF_ROUTE_TYPE:NSSA2  ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x03, 0x00, 0x35, // Prefix IPv4 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x09, 0x00, 0x02, 0x08, 0x0a, // IP ReachabilityInfo TLV, 10.0.0.0/8
+		}, "NLRI { PREFIXv4 { LOCAL_NODE: 0102.0304.0506 PREFIX: [10.0.0.0/8]  ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x03, 0x00, 0x2f, // Prefix IPv4 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			// Missing mandatory TLV (IP Reachability info)
+		}, "", true, false},
+		{[]byte{
+			0x00, 0x03, 0x00, 0x39, // Prefix IPv4 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			// IPv6 IP Reachability info in v4 prefix
+			0x01, 0x09, 0x00, 0x06, 0x40, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+		}, "", true, false},
+		{[]byte{
+			0x00, 0x04, 0x00, 0x35, // Prefix IPv6 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x09, 0x00, 0x02, 0x08, 0x0a, // IP ReachabilityInfo TLV, 10.0.0.0/8
+		}, "NLRI { PREFIXv6 { LOCAL_NODE: 0102.0304.0506 PREFIX: [a00::/8]  ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x04, 0x00, 0x43, // Prefix IPv6 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x09, 0x00, 0x02, 0x08, 0x0a, // IP ReachabilityInfo TLV, 10.0.0.0/8
+			0x01, 0x09, 0x00, 0x05, 0x1f, 0xc0, 0xa8, 0x07, 0xfe, // IP ReachabilityInfo TLV, 192.168.7.254/31
+			0x01, 0x08, 0x00, 0x01, 0x06, // OSPF Route Type TLV (NSSA2)
+		}, "NLRI { PREFIXv6 { LOCAL_NODE: 0102.0304.0506 PREFIX: [a00::/8 c0a8:7fe::/31] OSPF_ROUTE_TYPE:NSSA2  ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x04, 0x00, 0x35, // Prefix IPv6 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			0x01, 0x09, 0x00, 0x02, 0x08, 0x0a, // IP ReachabilityInfo TLV, 10.0.0.0/8
+		}, "NLRI { PREFIXv6 { LOCAL_NODE: 0102.0304.0506 PREFIX: [a00::/8]  ISIS-L2:0} }", false, true},
+		{[]byte{
+			0x00, 0x04, 0x00, 0x2f, // Prefix IPv6 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			// Missing mandatory TLV (IP Reachability info)
+		}, "", true, false},
+		{[]byte{
+			0x00, 0x04, 0x00, 0x39, // Prefix IPv6 NLRI, correct length
+			0x02,                                           // Protocol ISIS Level 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID
+			0x01, 0x00, 0x00, 0x22, // Local Node Desc
+			0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+			0x02, 0x01, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV BGP LS ID: 117901063
+			0x02, 0x02, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV OSPF Area ID: 117901063
+			0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+			// IPv6 IP Reachability info in v4 prefix
+			0x01, 0x09, 0x00, 0x06, 0x40, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+		}, "", true, false},
+	}
+
+	for _, test := range tests {
+		nlri := LsAddrPrefix{}
+		if test.err {
+			assert.Error(nlri.decodeFromBytes(test.in))
+		} else {
+			assert.NoError(nlri.decodeFromBytes(test.in))
+			assert.Equal(test.str, nlri.String())
+			if test.serialize {
+				got, err := nlri.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_LsTLVMultiTopoID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{[]byte{
+			0x01, 0x07, 0x00, 0x02, // Multi-Topology ID, correct length
+			0x00, 0x01, // Multi-Topology ID: 1
+		}, "{MultiTopoIDs: 1}", false, true},
+	}
+	for _, test := range tests {
+		topo := LsTLVMultiTopoID{}
+		if test.err {
+			assert.Error(topo.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(topo.DecodeFromBytes(test.in))
+			assert.Equal(test.str, topo.String())
+			if test.serialize {
+				got, err := topo.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_LsTLVSrv6SIDInfo(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{[]byte{
+			0x02, 0x06, 0x00, 0x10, // TLV SRv6 SID Information, correct length
+			0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // TLV SRv6 SID: fd00::1
+		}, "{SIDs: fd00::1}", false, true},
+	}
+	for _, test := range tests {
+		srv6 := LsTLVSrv6SIDInfo{}
+		if test.err {
+			assert.Error(srv6.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(srv6.DecodeFromBytes(test.in))
+			assert.Equal(test.str, srv6.String())
+			if test.serialize {
+				got, err := srv6.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+// The Multi-Topology Identifier TLV is optional in an SRv6 SID NLRI (RFC 9514,
+// Section 6), so an NLRI decoded without it must still serialize and render.
+func Test_LsSrv6SIDNLRIMultiTopoID(t *testing.T) {
+	base := []byte{
+		0x02,                                           // Protocol ID: IS-IS Level 2
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+		0x01, 0x00, 0x00, 0x10, // TLV Local Node Descriptor
+		0x02, 0x00, 0x00, 0x04, // Sub-TLV Autonomous System
+		0x00, 0x00, 0xfd, 0xe8, // AS: 65000
+		0x02, 0x03, 0x00, 0x04, // Sub-TLV IGP Router ID
+		0x0a, 0x00, 0x00, 0x01, // IGP Router ID: 10.0.0.1
+		0x02, 0x06, 0x00, 0x10, // TLV SRv6 SID Information
+		0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // SID: fd00::1
+	}
+	multiTopoID := []byte{
+		0x01, 0x07, 0x00, 0x02, // TLV Multi-Topology Identifier
+		0x00, 0x02, // Multi-Topology ID: 2
+	}
+
+	tests := []struct {
+		name    string
+		nlri    []byte
+		present bool
+	}{
+		{"without Multi-Topology ID", base, false},
+		{"with Multi-Topology ID", append(append([]byte{}, base...), multiTopoID...), true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			data := append([]byte{
+				0x00, 0x06, // NLRI Type: SRv6 SID
+				0x00, byte(len(test.nlri)), // Length
+			}, test.nlri...)
+
+			prefix := &LsAddrPrefix{}
+			assert.NoError(prefix.decodeFromBytes(data))
+
+			srv6 := prefix.NLRI.(*LsSrv6SIDNLRI)
+			if test.present {
+				assert.NotNil(srv6.MultiTopoID)
+			} else {
+				assert.Nil(srv6.MultiTopoID)
+			}
+
+			got, err := prefix.Serialize()
+			assert.NoError(err)
+			assert.Equal(data, got)
+
+			buf, err := json.Marshal(srv6)
+			assert.NoError(err)
+
+			if test.present {
+				assert.Contains(srv6.String(), "MULTI_TOPO_IDs")
+				assert.Contains(string(buf), "multi_topo")
+			} else {
+				assert.NotContains(srv6.String(), "MULTI_TOPO_IDs")
+				assert.NotContains(string(buf), "multi_topo")
+			}
+		})
+	}
+}
+
+// The Link-State NLRI types must report a missing or mistyped descriptor TLV as
+// an error instead of panicking on an unchecked type assertion. A decoded NLRI
+// always carries its mandatory TLVs, but one built programmatically may not.
+func Test_LsNLRIMarshalJSONMissingTLV(t *testing.T) {
+	tests := []struct {
+		name string
+		nlri json.Marshaler
+	}{
+		{"node without local node", &LsNodeNLRI{}},
+		{"link without local node", &LsLinkNLRI{}},
+		{"link without remote node", &LsLinkNLRI{LocalNodeDesc: &LsTLVNodeDescriptor{}}},
+		{"prefix v4 without local node", &LsPrefixV4NLRI{}},
+		{"prefix v6 without local node", &LsPrefixV6NLRI{}},
+		{"srv6 sid without local node", &LsSrv6SIDNLRI{}},
+		{"srv6 sid without SID info", &LsSrv6SIDNLRI{LocalNodeDesc: &LsTLVNodeDescriptor{}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := test.nlri.MarshalJSON()
+			assert.Error(t, err)
+		})
+	}
+}
+
+func Test_PathAttributeLs(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		json      string
+		serialize bool
+		err       bool
+	}{
+		{
+			[]byte{
+				// LS Attribute with all Node-related TLVs.
+				0x80, 0x29, 0x62, // Optional attribute, BGP_ATTR_TYPE_LS, correct length
+				0x04, 0x00, 0x00, 0x01, 0xFF, // Node flags (all set)
+				0x04, 0x01, 0x00, 0x03, 0x01, 0x02, 0x03, // Opaque Node Attr [1 2 3]
+				0x04, 0x02, 0x00, 0x03, 0x72, 0x74, 0x72, // Node name: "rtr"
+				0x04, 0x03, 0x00, 0x03, 0x72, 0x74, 0x72, // ISIS area: [114 116 114]
+				0x04, 0x04, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01, // Local RouterID 1.1.1.1
+				0x04, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, // Local Router ID 2001:db8::beef
+				0x04, 0x0a, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x88, 0xb8, 0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // Capabilities: Range 35000, first label: 100500
+				0x04, 0x0b, 0x00, 0x03, 0x01, 0x02, 0x03, // SR ALgorithm [1 2 3]
+				0x04, 0x0c, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x88, 0xb8, 0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // Local block: Range 35000, first label: 100500
+				0xde, 0xad, 0x00, 0x01, 0xFF, // Unknown TLV, preserved and propagated (RFC 9552 Section 5.1)
+			},
+			"{LsAttributes: {Node Flags: XXVRBETO} {Opaque attribute: [1 2 3]} {Node Name: rtr} {ISIS Area ID: [114 116 114]} {Local RouterID IPv4: 1.1.1.1} {Local RouterID IPv6: 2001:db8::beef} {SR Capabilities: Flags:0 SRGB Ranges: 100500:135500 } {SR Algorithms: [1 2 3]} {SR LocalBlock: Flags:0 SRGB Ranges: 100500:135500 } {Unknown TLV: 57005 Value: ff} }",
+			`{"type":41,"flags":128,"node":{"flags":{"overload":true,"attached":true,"external":true,"abr":true,"router":true,"v6":true},"opaque":"AQID","name":"rtr","isis_area":"cnRy","local_router_id_ipv4":"1.1.1.1","local_router_id_ipv6":"2001:db8::beef","sr_capabilities":{"ipv4_supported":false,"ipv6_supported":false,"ranges":[{"begin":100500,"end":135500}]},"sr_algorithms":"AQID","sr_local_block":{"ranges":[{"begin":100500,"end":135500}]}},"link":{"local_router_id_ipv4":"1.1.1.1","local_router_id_ipv6":"2001:db8::beef"},"prefix":{},"bgp_peer_segment":{},"srv6_sid":{}}`,
+			true, false,
+		},
+		{
+			[]byte{
+				// LS Attribute with all Node-related TLVs.
+				0x80, 0x29, 0x5d, // Optional attribute, BGP_ATTR_TYPE_LS, correct length
+				0x04, 0x00, 0x00, 0x01, 0xFF, // Node flags (all set)
+				0x04, 0x01, 0x00, 0x03, 0x01, 0x02, 0x03, // Opaque Node Attr [1 2 3]
+				0x04, 0x02, 0x00, 0x03, 0x72, 0x74, 0x72, // Node name: "rtr"
+				0x04, 0x03, 0x00, 0x03, 0x72, 0x74, 0x72, // ISIS area: [114 116 114]
+				0x04, 0x04, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01, // Local RouterID 1.1.1.1
+				0x04, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, // Local Router ID 2001:db8::beef
+				0x04, 0x0a, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x88, 0xb8, 0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // Capabilities: Range 35000, first label: 100500
+				0x04, 0x0b, 0x00, 0x03, 0x01, 0x02, 0x03, // SR Algorithm [1 2 3]
+				0x04, 0x0c, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x88, 0xb8, 0x04, 0x89, 0x00, 0x03, 0x01, 0x88, 0x94, // Local block: Range 35000, first label: 100500
+			},
+			"{LsAttributes: {Node Flags: XXVRBETO} {Opaque attribute: [1 2 3]} {Node Name: rtr} {ISIS Area ID: [114 116 114]} {Local RouterID IPv4: 1.1.1.1} {Local RouterID IPv6: 2001:db8::beef} {SR Capabilities: Flags:0 SRGB Ranges: 100500:135500 } {SR Algorithms: [1 2 3]} {SR LocalBlock: Flags:0 SRGB Ranges: 100500:135500 } }",
+			`{"type":41,"flags":128,"node":{"flags":{"overload":true,"attached":true,"external":true,"abr":true,"router":true,"v6":true},"opaque":"AQID","name":"rtr","isis_area":"cnRy","local_router_id_ipv4":"1.1.1.1","local_router_id_ipv6":"2001:db8::beef","sr_capabilities":{"ipv4_supported":false,"ipv6_supported":false,"ranges":[{"begin":100500,"end":135500}]},"sr_algorithms":"AQID","sr_local_block":{"ranges":[{"begin":100500,"end":135500}]}},"link":{"local_router_id_ipv4":"1.1.1.1","local_router_id_ipv6":"2001:db8::beef"},"prefix":{},"bgp_peer_segment":{},"srv6_sid":{}}`,
+			true, false,
+		},
+		{[]byte{
+			// LS Attribute with truncated length
+			0x80, 0x29, 0x04, // Optional attribute, BGP_ATTR_TYPE_LS, truncated length
+			0x04, 0x00, 0x00, 0x01, 0xFF, // Node flags (all set)
+		}, "", "", false, true},
+		{
+			[]byte{
+				// LS Attribute with all Link-related TLVs.
+				0x80, 0x29, 0x9a, // Optional attribute, BGP_ATTR_TYPE_LS, correct length
+				0x04, 0x04, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01, // Local RouterID 1.1.1.1
+				0x04, 0x05, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0xEF, // Local Router ID 2001:db8::beef
+				0x04, 0x06, 0x00, 0x04, 0x02, 0x02, 0x02, 0x02, // Local RouterID 2.2.2.2
+				0x04, 0x07, 0x00, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xAD, // Local Router ID 2001:db8::dead
+				0x04, 0x40, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // Admin Group 0x07070707
+				0x04, 0x41, 0x00, 0x04, 0x43, 0xA4, 0xB2, 0x00, // Max Link Bandwidth 329.39062
+				0x04, 0x42, 0x00, 0x04, 0x43, 0xA4, 0xB2, 0x00, // Max Reservable Bandwidth 329.39062
+				0x04, 0x43, 0x00, 0x20, 0x43, 0xA4, 0xB2, 0x00, 0x43, 0xA4, 0xB2, 0x00, 0x43, 0xA4, 0xB2, 0x00, 0x43, 0xA4, 0xB2, 0x00, 0x43, 0xA4, 0xB2, 0x00, 0x43, 0xA4, 0xB2, 0x00, 0x43, 0xA4, 0xB2, 0x00, 0x43, 0xA4, 0xB2, 0x00, // Unreserved Bandwidth 329.39062
+				0x04, 0x44, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TE Default Metric: 117901063
+				0x04, 0x47, 0x00, 0x01, 0x01, // IGP Metric 1
+				0x04, 0x49, 0x00, 0x03, 0x01, 0x02, 0x03, // Opaque Link Attr: [1 2 3]
+				0x04, 0x4a, 0x00, 0x03, 0x72, 0x74, 0x72, // Link Name: "rtr"
+				0x04, 0x4b, 0x00, 0x07, 0x01, 0x01, 0x00, 0x00, 0x01, 0x88, 0x94, // Adjacency SID: 100500
+			},
+			"{LsAttributes: {Local RouterID IPv4: 1.1.1.1} {Local RouterID IPv6: 2001:db8::beef} {Remote RouterID IPv4: 2.2.2.2} {Remote RouterID IPv6: 2001:db8::dead} {Admin Group: 07070707} {Max Link BW: 329.39062} {Max Reservable Link BW: 329.39062} {Unreserved BW: [329.39062 329.39062 329.39062 329.39062 329.39062 329.39062 329.39062 329.39062]} {TE Default metric: 117901063} {IGP metric: 1} {Opaque link attribute: [1 2 3]} {Link Name: rtr} {Adjacency SID: 100500} }",
+			`{"type":41,"flags":128,"node":{"local_router_id_ipv4":"1.1.1.1","local_router_id_ipv6":"2001:db8::beef"},"link":{"name":"rtr","local_router_id_ipv4":"1.1.1.1","local_router_id_ipv6":"2001:db8::beef","remote_router_id_ipv4":"2.2.2.2","remote_router_id_ipv6":"2001:db8::dead","admin_group":117901063,"default_te_metric":117901063,"igp_metric":1,"opaque":"AQID","bandwidth":329.39062,"reservable_bandwidth":329.39062,"unreserved_bandwidth":[329.39062,329.39062,329.39062,329.39062,329.39062,329.39062,329.39062,329.39062],"adjacency_sid":100500,"sr_adjacency_sids":[{"flags":1,"weight":1,"sid":100500}]},"prefix":{},"bgp_peer_segment":{},"srv6_sid":{}}`,
+			true, false,
+		},
+		{
+			[]byte{
+				// LS Attribute with all Link-related TLVs.
+				0x80, 0x29, 0x17, // Optional attribute, BGP_ATTR_TYPE_LS, correct length
+				0x04, 0x80, 0x00, 0x01, 0xFF, // IGP Flags: PLND
+				0x04, 0x85, 0x00, 0x03, 0x01, 0x02, 0x03, // Opaque prefix: [1 2 3]
+				0x04, 0x86, 0x00, 0x07, 0x01, 0x01, 0x00, 0x00, 0x01, 0x88, 0x94, // Prefix SID: 100500
+			},
+			"{LsAttributes: {IGP Flags: XXXXPLND} {Prefix opaque attribute: [1 2 3]} {Prefix SID: 100500} }",
+			// Per RFC 9085 Section 2.1.1 the Prefix-SID TLV carries
+			// a Flags + Algorithm header. The wire bytes above set
+			// Algorithm=1 / Flags=1 / SID=100500, so the projection
+			// puts the entry into sr_prefix_sids; the singular
+			// sr_prefix_sid is reserved for the Algorithm-0
+			// (default SPF) SID and stays unset here.
+			`{"type":41,"flags":128,"node":{},"link":{},"prefix":{"igp_flags":{"down":true,"no_unicast":true,"local_address":true,"propagate_nssa":true},"opaque":"AQID","sr_prefix_sids":[{"algorithm":1,"flags":1,"sid":100500}]},"bgp_peer_segment":{},"srv6_sid":{}}`,
+			true, false,
+		},
+	}
+
+	for _, test := range tests {
+		attr := PathAttributeLs{}
+		if test.err {
+			assert.Error(attr.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(attr.DecodeFromBytes(test.in))
+			got, err := attr.MarshalJSON()
+			assert.NoError(err)
+			assert.Equal(test.json, string(got))
+			assert.Equal(test.str, attr.String())
+
+			if test.serialize {
+				got, err := attr.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_PathAttributeLsDelayMetricTLVs(t *testing.T) {
+	assert := assert.New(t)
+
+	in := []byte{
+		0x80, 0x29, 0x1c, // Optional attribute, BGP_ATTR_TYPE_LS, length 28
+		0x04, 0x5a, 0x00, 0x04, 0x00, 0x00, 0x21, 0x44, // Unidirectional Link Delay, flags=0, delay=8516
+		0x04, 0x5b, 0x00, 0x08, 0x00, 0x00, 0x21, 0x3f, 0x00, 0x00, 0x21, 0x4f, // Min/Max Unidirectional Link Delay, flags=0, min=8511, max=8527
+		0x04, 0x5c, 0x00, 0x04, 0x00, 0x00, 0x00, 0x33, // Unidirectional Delay Variation, variation=51
+	}
+
+	attr := PathAttributeLs{}
+	assert.NoError(attr.DecodeFromBytes(in))
+	assert.Len(attr.TLVs, 3)
+
+	lsAttr := attr.Extract()
+
+	if assert.NotNil(lsAttr.Link.UnidirectionalLinkDelay) {
+		assert.Equal(uint32(8516), lsAttr.Link.UnidirectionalLinkDelay.Delay)
+		assert.False(lsAttr.Link.UnidirectionalLinkDelay.Flags.Anomalous)
+	}
+
+	if assert.NotNil(lsAttr.Link.MinMaxUnidirectionalLinkDelay) {
+		assert.Equal(uint32(8511), lsAttr.Link.MinMaxUnidirectionalLinkDelay.MinDelay)
+		assert.Equal(uint32(8527), lsAttr.Link.MinMaxUnidirectionalLinkDelay.MaxDelay)
+		assert.False(lsAttr.Link.MinMaxUnidirectionalLinkDelay.Flags.Anomalous)
+	}
+
+	if assert.NotNil(lsAttr.Link.UnidirectionalDelayVariation) {
+		assert.Equal(uint32(51), *lsAttr.Link.UnidirectionalDelayVariation)
+	}
+
+	got, err := attr.Serialize()
+	assert.NoError(err)
+	assert.Equal(in, got)
+}
+
+// Test_LsTLVFlexAlgoDef exercises the RFC 9351 Section 3 wire decode
+// for the BGP-LS FAD TLV (1039) plus every defined nested sub-TLV
+// (1040 Exclude-Any, 1041 Include-Any, 1042 Include-All, 1043 Flags,
+// 1045 Exclude SRLG, 1046 Unsupported). Round-trip serialise/decode is
+// verified for each fixture so the IANA codepoints stay byte-stable.
+func Test_LsTLVFlexAlgoDef(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		name string
+		in   []byte
+		want LsTLVFlexAlgoDef
+	}{
+		{
+			name: "fixed header only (algo 128, metric IGP, calc SPF, priority 100)",
+			// Type 1039 = 0x040F, Length 4, body: algo, metric, calc, prio.
+			in: []byte{0x04, 0x0F, 0x00, 0x04, 0x80, 0x00, 0x00, 0x64},
+			want: LsTLVFlexAlgoDef{
+				LsTLV:      LsTLV{Type: LS_TLV_FLEX_ALGO_DEF, Length: 4},
+				Algorithm:  128,
+				MetricType: 0,
+				CalcType:   0,
+				Priority:   100,
+			},
+		},
+		{
+			name: "algo 129 metric Min-Delay with Exclude-Any + Include-Any + Flags + Exclude-SRLG",
+			in: []byte{
+				0x04, 0x0F, 0x00, 0x24, // TLV 1039, length 36 (4-byte header + four 8-byte sub-TLVs)
+				0x81, 0x01, 0x00, 0xC8, // algo 129, metric 1 (Min-Delay), calc 0, prio 200
+				0x04, 0x10, 0x00, 0x04, 0x00, 0x00, 0x00, 0x0F, // sub-TLV 1040 Exclude-Any, EAG 0x0000000F
+				0x04, 0x11, 0x00, 0x04, 0x00, 0x00, 0x00, 0xF0, // sub-TLV 1041 Include-Any, EAG 0x000000F0
+				0x04, 0x13, 0x00, 0x04, 0x80, 0x00, 0x00, 0x00, // sub-TLV 1043 Flags, M-flag set
+				0x04, 0x15, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A, // sub-TLV 1045 Exclude SRLG = [42]
+			},
+			want: LsTLVFlexAlgoDef{
+				LsTLV:       LsTLV{Type: LS_TLV_FLEX_ALGO_DEF, Length: 36},
+				Algorithm:   129,
+				MetricType:  1,
+				CalcType:    0,
+				Priority:    200,
+				ExcludeAny:  []uint32{0x0F},
+				IncludeAny:  []uint32{0xF0},
+				Flags:       []byte{0x80, 0x00, 0x00, 0x00},
+				ExcludeSRLG: []uint32{42},
+			},
+		},
+		{
+			name: "algo 130 metric TE with Include-All + Unsupported",
+			in: []byte{
+				0x04, 0x0F, 0x00, 0x15, // TLV 1039, length 21
+				0x82, 0x02, 0x00, 0x32, // algo 130, metric 2 (TE), calc 0, prio 50
+				0x04, 0x12, 0x00, 0x04, 0x00, 0x00, 0x00, 0xAA, // sub-TLV 1042 Include-All, EAG 0xAA
+				0x04, 0x16, 0x00, 0x05, 0x02, 0x04, 0x10, 0x04, 0x11, // sub-TLV 1046 Unsupported, proto 2, types [1040 1041]
+			},
+			want: LsTLVFlexAlgoDef{
+				LsTLV:      LsTLV{Type: LS_TLV_FLEX_ALGO_DEF, Length: 21},
+				Algorithm:  130,
+				MetricType: 2,
+				CalcType:   0,
+				Priority:   50,
+				IncludeAll: []uint32{0xAA},
+				Unsupported: &LsTLVFADUnsupported{
+					ProtocolID:  2,
+					SubTLVTypes: []uint16{0x0410, 0x0411},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := LsTLVFlexAlgoDef{}
+			assert.NoError(got.DecodeFromBytes(tc.in))
+			assert.Equal(tc.want.Algorithm, got.Algorithm)
+			assert.Equal(tc.want.MetricType, got.MetricType)
+			assert.Equal(tc.want.CalcType, got.CalcType)
+			assert.Equal(tc.want.Priority, got.Priority)
+			assert.Equal(tc.want.ExcludeAny, got.ExcludeAny)
+			assert.Equal(tc.want.IncludeAny, got.IncludeAny)
+			assert.Equal(tc.want.IncludeAll, got.IncludeAll)
+			assert.Equal(tc.want.Flags, got.Flags)
+			assert.Equal(tc.want.ExcludeSRLG, got.ExcludeSRLG)
+			assert.Equal(tc.want.Unsupported, got.Unsupported)
+
+			out, err := got.Serialize()
+			assert.NoError(err)
+			assert.Equal(tc.in, out)
+		})
+	}
+}
+
+// Test_LsTLVFlexAlgoDef_Errors covers the malformed-input paths the
+// decoder must reject per RFC 9351 (truncated headers, reserved
+// algorithm IDs, sub-TLV length violations).
+func Test_LsTLVFlexAlgoDef_Errors(t *testing.T) {
+	assert := assert.New(t)
+
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{
+			name: "value shorter than 4-byte fixed header",
+			in:   []byte{0x04, 0x0F, 0x00, 0x02, 0x80, 0x00},
+		},
+		{
+			name: "algorithm 127 is reserved (RFC 9350 Section 4)",
+			in:   []byte{0x04, 0x0F, 0x00, 0x04, 0x7F, 0x00, 0x00, 0x64},
+		},
+		{
+			name: "Exclude-Any length not a multiple of 4",
+			in: []byte{
+				0x04, 0x0F, 0x00, 0x09,
+				0x80, 0x00, 0x00, 0x64,
+				0x04, 0x10, 0x00, 0x01, 0x00,
+			},
+		},
+		{
+			name: "Exclude SRLG length zero is malformed",
+			in: []byte{
+				0x04, 0x0F, 0x00, 0x08,
+				0x80, 0x00, 0x00, 0x64,
+				0x04, 0x15, 0x00, 0x00,
+			},
+		},
+		{
+			name: "Unsupported sub-TLV body length 0 is malformed",
+			in: []byte{
+				0x04, 0x0F, 0x00, 0x08,
+				0x80, 0x00, 0x00, 0x64,
+				0x04, 0x16, 0x00, 0x00,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := LsTLVFlexAlgoDef{}
+			assert.Error(got.DecodeFromBytes(tc.in))
+		})
+	}
+}
+
+// Test_LsTLVFlexAlgoDef_String covers the CLI render of the FAD TLV
+// so that operators see the affinity / SRLG / flags sub-TLVs and not
+// just the four fixed-header bytes.
+func Test_LsTLVFlexAlgoDef_String(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		name string
+		def  LsTLVFlexAlgoDef
+		want string
+	}{
+		{
+			name: "fixed header only",
+			def: LsTLVFlexAlgoDef{
+				Algorithm: 128, MetricType: 0, CalcType: 0, Priority: 100,
+			},
+			want: "{Flex-Algo Def: 128 metric:0 calc:0 prio:100}",
+		},
+		{
+			name: "with all affinity bitmaps and SRLG",
+			def: LsTLVFlexAlgoDef{
+				Algorithm:   129,
+				MetricType:  1,
+				CalcType:    0,
+				Priority:    200,
+				ExcludeAny:  []uint32{0x0F},
+				IncludeAny:  []uint32{0xF0},
+				IncludeAll:  []uint32{0xAA},
+				Flags:       []byte{0x80, 0x00, 0x00, 0x00},
+				ExcludeSRLG: []uint32{42, 43},
+			},
+			want: "{Flex-Algo Def: 129 metric:1 calc:0 prio:200" +
+				" exclude-any:[0x0000000f] include-any:[0x000000f0]" +
+				" include-all:[0x000000aa] flags:[0x80 0x00 0x00 0x00]" +
+				" exclude-srlg:[42 43]}",
+		},
+		{
+			name: "with unsupported sub-TLV",
+			def: LsTLVFlexAlgoDef{
+				Algorithm: 130, MetricType: 2, CalcType: 0, Priority: 50,
+				Unsupported: &LsTLVFADUnsupported{
+					ProtocolID:  2,
+					SubTLVTypes: []uint16{1040, 1041},
+				},
+			},
+			want: "{Flex-Algo Def: 130 metric:2 calc:0 prio:50" +
+				" unsupported:{proto:2 types:[1040 1041]}}",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(tc.want, tc.def.String())
+		})
+	}
+}
+
+// Test_LsTLVFADPrefixMetric exercises the RFC 9351 Section 4 FAPM
+// wire format (TLV 1044, fixed 8-byte value).
+func Test_LsTLVFADPrefixMetric(t *testing.T) {
+	assert := assert.New(t)
+
+	in := []byte{
+		0x04, 0x14, 0x00, 0x08, // TLV 1044, length 8
+		0x80, 0x00, 0x00, 0x00, // algo 128, flags 0, reserved 0x0000
+		0x00, 0x00, 0x27, 0x10, // metric = 10000
+	}
+
+	got := LsTLVFADPrefixMetric{}
+	assert.NoError(got.DecodeFromBytes(in))
+	assert.Equal(uint8(128), got.Algorithm)
+	assert.Equal(uint8(0), got.Flags)
+	assert.Equal(uint32(10000), got.Metric)
+
+	out, err := got.Serialize()
+	assert.NoError(err)
+	assert.Equal(in, out)
+}
+
+// Test_PathAttributeLs_MultiPrefixSID confirms that the Extract path
+// aggregates every Prefix-SID TLV observed on the same Prefix NLRI
+// instead of overwriting earlier entries. Regression test for the
+// last-write-wins behaviour the legacy projection had.
+func Test_PathAttributeLs_MultiPrefixSID(t *testing.T) {
+	assert := assert.New(t)
+
+	in := []byte{
+		0x80, 0x29, 0x16, // Optional attribute, BGP_ATTR_TYPE_LS, length 22 (two 11-byte Prefix-SID TLVs)
+		0x04, 0x86, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01, 0x88, 0x94, // Prefix-SID algo 0, SID 100500
+		0x04, 0x86, 0x00, 0x07, 0x40, 0x80, 0x00, 0x00, 0x01, 0x88, 0x95, // Prefix-SID algo 128, SID 100501
+	}
+
+	attr := PathAttributeLs{}
+	assert.NoError(attr.DecodeFromBytes(in))
+
+	ls := attr.Extract()
+	assert.NotNil(ls.Prefix.SrPrefixSID)
+	if ls.Prefix.SrPrefixSID != nil {
+		assert.Equal(uint32(100500), *ls.Prefix.SrPrefixSID)
+	}
+	assert.Len(ls.Prefix.SrPrefixSIDs, 2)
+	if len(ls.Prefix.SrPrefixSIDs) == 2 {
+		assert.Equal(uint8(0), ls.Prefix.SrPrefixSIDs[0].Algorithm)
+		assert.Equal(uint32(100500), ls.Prefix.SrPrefixSIDs[0].SID)
+		assert.Equal(uint8(128), ls.Prefix.SrPrefixSIDs[1].Algorithm)
+		assert.Equal(uint32(100501), ls.Prefix.SrPrefixSIDs[1].SID)
+	}
+}
+
+func Test_PathAttributeLs_DualStackAdjacencySID(t *testing.T) {
+	assert := assert.New(t)
+
+	in := []byte{
+		0x80, 0x29, 0x16, // Optional attribute, BGP_ATTR_TYPE_LS, length 22 (two 11-byte Adjacency-SID TLVs)
+		0x04, 0x4b, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, 0x88, 0x94, // Adjacency-SID, F=0 (IPv4), SID 100500
+		0x04, 0x4b, 0x00, 0x07, 0x80, 0x01, 0x00, 0x00, 0x01, 0x88, 0x95, // Adjacency-SID, F=1 (IPv6), SID 100501
+	}
+
+	attr := PathAttributeLs{}
+	assert.NoError(attr.DecodeFromBytes(in))
+
+	ls := attr.Extract()
+	assert.NotNil(ls.Link.SrAdjacencySID)
+	if ls.Link.SrAdjacencySID != nil {
+		assert.Equal(uint32(100501), *ls.Link.SrAdjacencySID)
+	}
+	assert.Len(ls.Link.SrAdjacencySIDs, 2)
+	if len(ls.Link.SrAdjacencySIDs) == 2 {
+		assert.Equal(uint8(0x00), ls.Link.SrAdjacencySIDs[0].Flags)
+		assert.Equal(uint32(100500), ls.Link.SrAdjacencySIDs[0].SID)
+		assert.Equal(uint8(0x80), ls.Link.SrAdjacencySIDs[1].Flags)
+		assert.Equal(uint32(100501), ls.Link.SrAdjacencySIDs[1].SID)
+	}
+}
+
+func Test_BGPOpenDecodeCapabilities(t *testing.T) {
+	// BGP OPEN message with add-path and long-lived-graceful-restart capabilities,
+	// in that order.
+	openBytes := []byte{
+		0x04,       // version: 4
+		0xfa, 0x7b, // my as: 64123
+		0x00, 0xf0, // hold time: 240 seconds
+		0x7f, 0x00, 0x00, 0x02, // BGP identifier: 127.0.0.2
+		0x19, // optional parameters length: 25
+		0x02, // parameter type: capability
+		0x17, // parameter length: 23
+
+		0x05,       // capability type: extended next hop
+		0x06,       // caability length: 6
+		0x00, 0x01, // AFI: IPv4
+		0x00, 0x01, // SAFI: unicast
+		0x00, 0x02, // next hop AFI: IPv6
+
+		0x45,       // capability type: ADD-PATH
+		0x04,       // capability length: 4
+		0x00, 0x01, // AFI: IPv4
+		0x01, // SAFI: unicast
+		0x02, // Send/Receive: Send
+
+		0x47, // capability type: Long-lived-graceful-restart
+		0x07, // capability length: 7
+		0x00, 0x01, 0x01, 0x00, 0x00, 0x0e, 0x10,
+	}
+
+	open := &BGPOpen{}
+	err := open.DecodeFromBytes(openBytes)
+	assert.NoError(t, err)
+
+	capMap := make(map[BGPCapabilityCode][]ParameterCapabilityInterface)
+	for _, p := range open.OptParams {
+		if paramCap, y := p.(*OptionParameterCapability); y {
+			t.Logf("parameter capability: %+v", paramCap)
+			for _, c := range paramCap.Capability {
+				m, ok := capMap[c.Code()]
+				if !ok {
+					m = make([]ParameterCapabilityInterface, 0, 1)
+				}
+				capMap[c.Code()] = append(m, c)
+			}
+		}
+	}
+
+	assert.Len(t, capMap[BGP_CAP_EXTENDED_NEXTHOP], 1)
+	nexthopTuples := capMap[BGP_CAP_EXTENDED_NEXTHOP][0].(*CapExtendedNexthop).Tuples
+	assert.Len(t, nexthopTuples, 1)
+	assert.Equal(t, nexthopTuples[0].NLRIAFI, uint16(AFI_IP))
+	assert.Equal(t, nexthopTuples[0].NLRISAFI, uint16(SAFI_UNICAST))
+	assert.Equal(t, nexthopTuples[0].NexthopAFI, uint16(AFI_IP6))
+
+	assert.Len(t, capMap[BGP_CAP_ADD_PATH], 1)
+	tuples := capMap[BGP_CAP_ADD_PATH][0].(*CapAddPath).Tuples
+	assert.Len(t, tuples, 1)
+	assert.Equal(t, tuples[0].Family, RF_IPv4_UC)
+	assert.Equal(t, tuples[0].Mode, BGP_ADD_PATH_SEND)
+}
+
+//nolint:errcheck
+func FuzzParseBGPMessage(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		ParseBGPMessage(data)
+	})
+}
+
+//nolint:errcheck
+func FuzzParseFlowSpecComponents(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data string) {
+		ParseFlowSpecComponents(RF_FS_IPv4_UC, data)
+	})
+}
+
+// grep -r DecodeFromBytes pkg/packet/bgp/ | grep -e ":func " | perl -pe 's|func \(.* \*(.*?)\).*|(&\1\{\})\.DecodeFromBytes(data)|g' | awk -F ':' '{print $2}'
+//
+//nolint:errcheck
+func FuzzDecodeFromBytes(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		(&MUPNLRI{}).decodeFromBytes(data)
+		if len(data) >= 2 {
+			l := len(data)
+			afi := binary.BigEndian.Uint16(data[l-2 : l])
+			(&MUPInterworkSegmentDiscoveryRoute{}).DecodeFromBytes(data[:l-2], afi)
+			(&MUPDirectSegmentDiscoveryRoute{}).DecodeFromBytes(data[:l-2], afi)
+			(&MUPType1SessionTransformedRoute{}).DecodeFromBytes(data[:l-2], afi)
+			(&MUPType2SessionTransformedRoute{}).DecodeFromBytes(data[:l-2], afi)
+		}
+		(&DefaultParameterCapability{}).DecodeFromBytes(data)
+		(&CapMultiProtocol{}).DecodeFromBytes(data)
+		(&CapExtendedNexthop{}).DecodeFromBytes(data)
+		(&CapGracefulRestart{}).DecodeFromBytes(data)
+		(&CapFourOctetASNumber{}).DecodeFromBytes(data)
+		(&CapAddPath{}).DecodeFromBytes(data)
+		(&CapLongLivedGracefulRestart{}).DecodeFromBytes(data)
+		(&CapFQDN{}).DecodeFromBytes(data)
+		(&CapSoftwareVersion{}).DecodeFromBytes(data)
+		(&OptionParameterCapability{}).DecodeFromBytes(data)
+		(&BGPOpen{}).DecodeFromBytes(data)
+		(&IPAddrPrefix{}).decodeFromBytes(data, net.IPv4len)
+		(&IPAddrPrefix{}).decodeFromBytes(data, net.IPv6len)
+		(&RouteDistinguisherTwoOctetAS{}).DecodeFromBytes(data)
+		(&RouteDistinguisherIPAddressAS{}).DecodeFromBytes(data)
+		(&RouteDistinguisherFourOctetAS{}).DecodeFromBytes(data)
+		(&RouteDistinguisherUnknown{}).DecodeFromBytes(data)
+		(&MPLSLabelStack{}).DecodeFromBytes(data)
+		(&LabeledVPNIPAddrPrefix{}).decodeFromBytes(data, net.IPv4len)
+		(&LabeledVPNIPAddrPrefix{}).decodeFromBytes(data, net.IPv6len)
+		(&LabeledIPAddrPrefix{}).decodeFromBytes(data, net.IPv4len)
+		(&LabeledIPAddrPrefix{}).decodeFromBytes(data, net.IPv6len)
+		(&RouteTargetMembershipNLRI{}).decodeFromBytes(data)
+		(&EthernetSegmentIdentifier{}).DecodeFromBytes(data)
+		(&EVPNEthernetAutoDiscoveryRoute{}).DecodeFromBytes(data)
+		(&EVPNMacIPAdvertisementRoute{}).DecodeFromBytes(data)
+		(&EVPNMulticastEthernetTagRoute{}).DecodeFromBytes(data)
+		(&EVPNEthernetSegmentRoute{}).DecodeFromBytes(data)
+		(&EVPNIPPrefixRoute{}).DecodeFromBytes(data)
+		(&EVPNIPMSIRoute{}).DecodeFromBytes(data)
+		(&EVPNNLRI{}).decodeFromBytes(data)
+		(&EncapNLRI{}).decodeFromBytes(data)
+		(&flowSpecPrefix{}).DecodeFromBytes(data)
+		(&flowSpecPrefix6{}).DecodeFromBytes(data)
+		(&flowSpecMac{}).DecodeFromBytes(data)
+		(&FlowSpecComponent{}).DecodeFromBytes(data)
+		(&FlowSpecUnknown{}).DecodeFromBytes(data)
+		(&FlowSpecNLRI{rf: RF_FS_IPv4_UC}).decodeFromBytes(data)
+		(&FlowSpecNLRI{rf: RF_FS_IPv6_UC}).decodeFromBytes(data)
+		(&FlowSpecNLRI{rf: RF_FS_IPv4_VPN}).decodeFromBytes(data)
+		(&FlowSpecNLRI{rf: RF_FS_IPv6_VPN}).decodeFromBytes(data)
+		(&FlowSpecNLRI{rf: RF_FS_L2_VPN}).decodeFromBytes(data)
+		(&OpaqueNLRI{}).decodeFromBytes(data)
+		(&LsNLRI{}).DecodeFromBytes(data)
+		(&LsNodeNLRI{}).DecodeFromBytes(data)
+		(&LsLinkNLRI{}).DecodeFromBytes(data)
+		(&LsPrefixV4NLRI{}).DecodeFromBytes(data)
+		(&LsPrefixV6NLRI{}).DecodeFromBytes(data)
+		(&LsTLVSrv6SIDInfo{}).DecodeFromBytes(data)
+		(&LsTLVMultiTopoID{}).DecodeFromBytes(data)
+		(&LsSrv6SIDNLRI{}).DecodeFromBytes(data)
+		(&LsSrPolicyCandidatePathNLRI{}).DecodeFromBytes(data)
+		(&LsTLVSrPolicyCandidatePathDescriptor{}).DecodeFromBytes(data)
+		(&LsTLVSrBindingSID{}).DecodeFromBytes(data)
+		(&LsTLVSrv6BindingSID{}).DecodeFromBytes(data)
+		(&LsTLVSrCandidatePathState{}).DecodeFromBytes(data)
+		(&LsTLVSrCandidatePathName{}).DecodeFromBytes(data)
+		(&LsTLVSrPolicyName{}).DecodeFromBytes(data)
+		(&LsTLVSrSegmentListMetric{}).DecodeFromBytes(data)
+		(&LsTLVSrSegmentListBandwidth{}).DecodeFromBytes(data)
+		(&LsTLVSrSegmentListIdentifier{}).DecodeFromBytes(data)
+		(&LsTLVSrSegment{}).DecodeFromBytes(data)
+		(&LsTLVSrSegmentList{}).DecodeFromBytes(data)
+		(&LsTLVSrCandidatePathConstraints{}).DecodeFromBytes(data)
+		(&LsTLVSrAffinityConstraint{}).DecodeFromBytes(data)
+		(&LsTLVSrSRLGConstraint{}).DecodeFromBytes(data)
+		(&LsTLVSrBandwidthConstraint{}).DecodeFromBytes(data)
+		(&LsTLVSrDisjointGroupConstraint{}).DecodeFromBytes(data)
+		(&LsTLVSrBidirectionalGroupConstraint{}).DecodeFromBytes(data)
+		(&LsTLVSrMetricConstraint{}).DecodeFromBytes(data)
+		(&LsTLV{}).DecodeFromBytes(data)
+		(&LsTLVLinkID{}).DecodeFromBytes(data)
+		(&LsTLVIPv4InterfaceAddr{}).DecodeFromBytes(data)
+		(&LsTLVIPv4NeighborAddr{}).DecodeFromBytes(data)
+		(&LsTLVIPv6InterfaceAddr{}).DecodeFromBytes(data)
+		(&LsTLVIPv6NeighborAddr{}).DecodeFromBytes(data)
+		(&LsTLVNodeFlagBits{}).DecodeFromBytes(data)
+		(&LsTLVNodeName{}).DecodeFromBytes(data)
+		(&LsTLVIsisArea{}).DecodeFromBytes(data)
+		(&LsTLVLocalIPv4RouterID{}).DecodeFromBytes(data)
+		(&LsTLVRemoteIPv4RouterID{}).DecodeFromBytes(data)
+		(&LsTLVLocalIPv6RouterID{}).DecodeFromBytes(data)
+		(&LsTLVRemoteIPv6RouterID{}).DecodeFromBytes(data)
+		(&LsTLVOpaqueNodeAttr{}).DecodeFromBytes(data)
+		(&LsTLVAutonomousSystem{}).DecodeFromBytes(data)
+		(&LsTLVBgpLsID{}).DecodeFromBytes(data)
+		(&LsTLVIgpRouterID{}).DecodeFromBytes(data)
+		(&LsTLVOspfAreaID{}).DecodeFromBytes(data)
+		(&LsTLVBgpRouterID{}).DecodeFromBytes(data)
+		(&LsTLVBgpConfederationMember{}).DecodeFromBytes(data)
+		(&LsTLVOspfRouteType{}).DecodeFromBytes(data)
+		(&LsTLVIPReachability{}).DecodeFromBytes(data)
+		(&LsTLVAdminGroup{}).DecodeFromBytes(data)
+		(&LsTLVMaxLinkBw{}).DecodeFromBytes(data)
+		(&LsTLVMaxReservableLinkBw{}).DecodeFromBytes(data)
+		(&LsTLVUnreservedBw{}).DecodeFromBytes(data)
+		(&LsTLVTEDefaultMetric{}).DecodeFromBytes(data)
+		(&LsTLVUnidirectionalLinkDelay{}).DecodeFromBytes(data)
+		(&LsTLVMinMaxUnidirectionalLinkDelay{}).DecodeFromBytes(data)
+		(&LsTLVUnidirectionalDelayVariation{}).DecodeFromBytes(data)
+		(&LsTLVIGPMetric{}).DecodeFromBytes(data)
+		(&LsTLVLinkName{}).DecodeFromBytes(data)
+		(&LsTLVSrAlgorithm{}).DecodeFromBytes(data)
+		(&LsTLVSrCapabilities{}).DecodeFromBytes(data)
+		(&LsTLVSrLocalBlock{}).DecodeFromBytes(data)
+		(&LsTLVAdjacencySID{}).DecodeFromBytes(data)
+		(&LsTLVPeerNodeSID{}).DecodeFromBytes(data)
+		(&LsTLVPeerAdjacencySID{}).DecodeFromBytes(data)
+		(&LsTLVPeerSetSID{}).DecodeFromBytes(data)
+		(&LsTLVSIDLabel{}).DecodeFromBytes(data)
+		(&LsTLVPrefixSID{}).DecodeFromBytes(data)
+		(&LsTLVSourceRouterID{}).DecodeFromBytes(data)
+		(&LsTLVOpaqueLinkAttr{}).DecodeFromBytes(data)
+		(&LsTLVSrlg{}).DecodeFromBytes(data)
+		(&LsTLVIGPFlags{}).DecodeFromBytes(data)
+		(&LsTLVOpaquePrefixAttr{}).DecodeFromBytes(data)
+		(&LsTLVNodeDescriptor{}).DecodeFromBytes(data)
+		(&LsAddrPrefix{}).decodeFromBytes(data)
+		(&PathAttributeLs{}).DecodeFromBytes(data)
+		(&PathAttribute{}).DecodeFromBytes(data)
+		(&PathAttributeOrigin{}).DecodeFromBytes(data)
+		(&AsPathParam{}).DecodeFromBytes(data)
+		(&As4PathParam{}).DecodeFromBytes(data)
+		(&PathAttributeAsPath{}).DecodeFromBytes(data)
+		(&PathAttributeNextHop{}).DecodeFromBytes(data)
+		(&PathAttributeMultiExitDisc{}).DecodeFromBytes(data)
+		(&PathAttributeLocalPref{}).DecodeFromBytes(data)
+		(&PathAttributeAtomicAggregate{}).DecodeFromBytes(data)
+		(&PathAttributeAggregator{}).DecodeFromBytes(data)
+		(&PathAttributeCommunities{}).DecodeFromBytes(data)
+		(&PathAttributeOriginatorId{}).DecodeFromBytes(data)
+		(&PathAttributeClusterList{}).DecodeFromBytes(data)
+		(&PathAttributeMpReachNLRI{}).DecodeFromBytes(data)
+		(&PathAttributeMpUnreachNLRI{}).DecodeFromBytes(data)
+		(&PathAttributeExtendedCommunities{}).DecodeFromBytes(data)
+		(&PathAttributeAs4Path{}).DecodeFromBytes(data)
+		(&PathAttributeAs4Aggregator{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLV{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVUnknown{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVEncapsulation{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVProtocol{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVColor{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVEgressEndpoint{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVUDPDestPort{}).DecodeFromBytes(data)
+		(&TunnelEncapTLV{}).DecodeFromBytes(data)
+		(&PathAttributeTunnelEncap{}).DecodeFromBytes(data)
+		(&PathAttributePmsiTunnel{}).DecodeFromBytes(data)
+		(&PathAttributeIP6ExtendedCommunities{}).DecodeFromBytes(data)
+		(&PathAttributeAigp{}).DecodeFromBytes(data)
+		(&PathAttributeLargeCommunities{}).DecodeFromBytes(data)
+		(&PathAttributeUnknown{}).DecodeFromBytes(data)
+		(&BGPUpdate{}).DecodeFromBytes(data)
+		(&BGPNotification{}).DecodeFromBytes(data)
+		(&BGPKeepAlive{}).DecodeFromBytes(data)
+		(&BGPRouteRefresh{}).DecodeFromBytes(data)
+		(&BGPHeader{}).DecodeFromBytes(data)
+		(&SRPolicyNLRI{rf: RF_SR_POLICY_IPv4}).decodeFromBytes(data)
+		(&SRPolicyNLRI{rf: RF_SR_POLICY_IPv6}).decodeFromBytes(data)
+		(&TunnelEncapSubTLVSRPreference{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVSRPriority{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVSRCandidatePathName{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVSRENLP{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVSRBSID{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVSRv6BSID{}).DecodeFromBytes(data)
+		(&SegmentListWeight{}).DecodeFromBytes(data)
+		(&SegmentTypeA{}).DecodeFromBytes(data)
+		(&SRv6EndpointBehaviorStructure{}).DecodeFromBytes(data)
+		(&SegmentTypeB{}).DecodeFromBytes(data)
+		(&TunnelEncapSubTLVSRSegmentList{}).DecodeFromBytes(data)
+		(&TLV{}).DecodeFromBytes(data)
+		(&SubTLV{}).DecodeFromBytes(data)
+		(&SubSubTLV{}).DecodeFromBytes(data)
+
+		// The BGP Prefix-SID TLVs carry a declared Length that the
+		// serializers size their buffers from, so decoding alone does
+		// not exercise the decode/serialize contract. Re-serialize
+		// whatever decoded successfully: an accepted object must never
+		// panic on the way back out.
+		psid := &PathAttributePrefixSID{}
+		if psid.DecodeFromBytes(data) == nil {
+			psid.Serialize()
+		}
+		fuzzPrefixSIDRoundTrip(data,
+			&SRv6L3ServiceAttribute{},
+			&SRv6ServiceTLV{},
+			&SRv6InformationSubTLV{},
+			&SRv6SIDStructureSubSubTLV{},
+		)
+
+		// The VPLS NLRI has the same shape of contract: it carries a
+		// declared length, and Serialize() dereferences the route
+		// distinguisher that decoding is supposed to have set.
+		vpls := &VPLSNLRI{}
+		if vpls.decodeFromBytes(data) == nil {
+			vpls.Serialize()
+		}
+	})
+}
+
+// fuzzPrefixSIDRoundTrip decodes data into each TLV and re-serializes the ones
+// that accepted it.
+//
+//nolint:errcheck
+func fuzzPrefixSIDRoundTrip(data []byte, tlvs ...PrefixSIDTLVInterface) {
+	for _, tlv := range tlvs {
+		if tlv.DecodeFromBytes(data) == nil {
+			tlv.Serialize()
+		}
+	}
+}
+
+func Test_LsTLVSrv6EndXSID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{[]byte{
+			0x04, 0x52, 0x00, 0x16, // TLV SRv6 End.X SID, length = 22 (6 + 16, no sub-TLV)
+			0x00, 0x39, // Endpoint Behavior = 57 (End.X)
+			0x00, // Flags = 0
+			0x00, // Algorithm = 0 (SPF)
+			0x64, // Weight = 100
+			0x00, // Reserved = 0
+			// SID (16 bytes)
+			0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+		}, "{SRv6 End.X SID: EndpointBehavior:57 SIDs: fd00::1  LocalBlock:0 LocalNode:0 LocalFunc:0 LocalArg:0}", false, true},
+		{[]byte{
+			0x04, 0x52, 0x00, 0x15, // Incorrect length (should be at least 22)
+		}, "", true, false},
+	}
+
+	for _, test := range tests {
+		srv6 := LsTLVSrv6EndXSID{}
+		if test.err {
+			assert.Error(srv6.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(srv6.DecodeFromBytes(test.in))
+			assert.Equal(test.str, srv6.String())
+			if test.serialize {
+				got, err := srv6.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_LsTLVSrv6SIDStructure(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{[]byte{
+			0x04, 0xe4, 0x00, 0x04, // TLV SRv6 SID Structure, length = 4
+			0x28, // LocalBlock = 40
+			0x28, // LocalNode = 40
+			0x10, // LocalFunc = 16
+			0x00, // LocalArg = 0
+		}, "{SRv6 SID Structure: LocalBlock:40 LocalNode:40 LocalFunc:16 LocalArg:0}", false, true},
+		{[]byte{
+			0x04, 0xe4, 0x00, 0x03, // Incorrect length (should be 4)
+			0x28, 0x28, 0x10,
+		}, "", true, false},
+	}
+
+	for _, test := range tests {
+		srv6 := LsTLVSrv6SIDStructure{}
+		if test.err {
+			assert.Error(srv6.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(srv6.DecodeFromBytes(test.in))
+			assert.Equal(test.str, srv6.String())
+			if test.serialize {
+				got, err := srv6.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_LsTLVSrv6BgpPeerNodeSID(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{[]byte{
+			0x04, 0xe3, 0x00, 0x0c, // TLV SRv6 BGP PeerNode SID, length = 12
+			0x01,       // Flags = 1
+			0x64,       // Weight = 100
+			0x00, 0x00, // Reserved = 0
+			0x00, 0x00, 0xfd, 0xe8, // Peer AS Number = 65000
+			0x01, 0x01, 0x01, 0x01, // Peer BGP ID = 1.1.1.1
+		}, "{SRv6 BGP PeerNode SID: Flags:1 Weight:100 PeerAS:65000 PeerBgpID:1.1.1.1}", false, true},
+		{[]byte{
+			0x04, 0xe3, 0x00, 0x0b, // Incorrect length (should be 12)
+			0x01, 0x64, 0x00, 0x00, 0x00, 0x00, 0xfd, 0xe8, 0x01, 0x01, 0x01,
+		}, "", true, false},
+	}
+
+	for _, test := range tests {
+		srv6 := LsTLVSrv6BgpPeerNodeSID{}
+		if test.err {
+			assert.Error(srv6.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(srv6.DecodeFromBytes(test.in))
+			assert.Equal(test.str, srv6.String())
+			if test.serialize {
+				got, err := srv6.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func Test_LsTLVSrv6EndpointBehavior(t *testing.T) {
+	assert := assert.New(t)
+
+	tests := []struct {
+		in        []byte
+		str       string
+		err       bool
+		serialize bool
+	}{
+		{[]byte{
+			0x04, 0xe2, 0x00, 0x04, // TLV SRv6 Endpoint Behavior, length = 4
+			0x00, 0x30, // Endpoint Behavior = 48 (End)
+			0x01, // Flags = 1
+			0x00, // Algorithm = 0 (SPF)
+		}, "{SRv6 Endpoint Behavior: EndpointBehavior:48 Flags:1 Algorithm:0}", false, true},
+		{[]byte{
+			0x04, 0xe2, 0x00, 0x03, // Incorrect length (should be 4)
+			0x00, 0x01, 0x01,
+		}, "", true, false},
+	}
+
+	for _, test := range tests {
+		srv6 := LsTLVSrv6EndpointBehavior{}
+		if test.err {
+			assert.Error(srv6.DecodeFromBytes(test.in))
+		} else {
+			assert.NoError(srv6.DecodeFromBytes(test.in))
+			assert.Equal(test.str, srv6.String())
+			if test.serialize {
+				got, err := srv6.Serialize()
+				assert.NoError(err)
+				assert.Equal(test.in, got)
+			}
+		}
+	}
+}
+
+func TestParseSubTLVsOverflow(t *testing.T) {
+	l := &LsTLVSrv6EndXSID{}
+
+	// tlvLen = 65532 (0xFFFC) makes (uint16(4) + tlvLen) wrap to 0 in the buggy code.
+	data := []byte{0x00, 0x00, 0xFF, 0xFC}
+	if err := l.parseSubTLVs(data); err == nil {
+		t.Fatal("expected error for truncated Sub-TLV")
+	}
+}
+
+// Test for issue #3292: 2-byte AS_PATH decoding with explicit option
+func TestAsPathDecoding2Byte(t *testing.T) {
+	// AS_PATH with values 100, 200, 300 encoded as 2-byte AS
+	// Segment 1: AS_SEQUENCE (type=2), count=2, AS 100, AS 200
+	// Segment 2: AS_SEQUENCE (type=2), count=1, AS 300
+	data := []byte{
+		0x40, 0x02, 0x0a, // PathAttribute: flags=0x40, type=AS_PATH, length=10
+		0x02, 0x02, 0x00, 0x64, 0x00, 0xc8, // Segment 1: type=2, count=2, AS 100, 200
+		0x02, 0x01, 0x01, 0x2c, // Segment 2: type=2, count=1, AS 300
+	}
+
+	// Decode with Use2ByteAS=true (2-byte AS)
+	asPath := &PathAttributeAsPath{}
+	err := asPath.DecodeFromBytes(data, &MarshallingOption{Use2ByteAS: true})
+	if err != nil {
+		t.Fatalf("Failed to decode 2-byte AS_PATH: %v", err)
+	}
+
+	// Verify the AS numbers are correct
+	expectedAS := []uint32{100, 200, 300}
+	var actualAS []uint32
+	for _, param := range asPath.Value {
+		actualAS = append(actualAS, param.GetAS()...)
+	}
+
+	if len(actualAS) != len(expectedAS) {
+		t.Fatalf("Expected %d AS numbers, got %d", len(expectedAS), len(actualAS))
+	}
+	for i, as := range expectedAS {
+		if actualAS[i] != as {
+			t.Errorf("AS[%d]: expected %d, got %d", i, as, actualAS[i])
+		}
+	}
+}
+
+// Test for issue #3292: 4-byte AS_PATH decoding with explicit option
+func TestAsPathDecoding4Byte(t *testing.T) {
+	// AS_PATH with values 100000, 200000 encoded as 4-byte AS
+	// Segment: AS_SEQUENCE (type=2), count=2, AS 100000, AS 200000
+	data := []byte{
+		0x40, 0x02, 0x0a, // PathAttribute: flags=0x40, type=AS_PATH, length=10
+		0x02, 0x02, // Segment: type=2, count=2
+		0x00, 0x01, 0x86, 0xa0, // AS 100000 (0x186a0)
+		0x00, 0x03, 0x0d, 0x40, // AS 200000 (0x30d40)
+	}
+
+	// Decode with Use2ByteAS=false (4-byte AS, or use default)
+	asPath := &PathAttributeAsPath{}
+	err := asPath.DecodeFromBytes(data, &MarshallingOption{Use2ByteAS: false})
+	if err != nil {
+		t.Fatalf("Failed to decode 4-byte AS_PATH: %v", err)
+	}
+
+	// Verify the AS numbers are correct
+	expectedAS := []uint32{100000, 200000}
+	var actualAS []uint32
+	for _, param := range asPath.Value {
+		actualAS = append(actualAS, param.GetAS()...)
+	}
+
+	if len(actualAS) != len(expectedAS) {
+		t.Fatalf("Expected %d AS numbers, got %d", len(expectedAS), len(actualAS))
+	}
+	for i, as := range expectedAS {
+		if actualAS[i] != as {
+			t.Errorf("AS[%d]: expected %d, got %d", i, as, actualAS[i])
+		}
+	}
+}
+
+// --- BGP-LS sub-TLV decoding bugfix tests ---
+//
+// These tests cover the bugfix in the default-branch of the sub-TLV decoder
+// loops in LsTLVNodeDescriptor / LsLinkNLRI / LsPrefixV4NLRI / LsPrefixV6NLRI.
+// The previous implementation mutated the parent Length field as a side
+// effect when skipping unknown sub-TLVs and used a wrong upper bound for the
+// length sanity check (`l.Length` instead of `len(tlv)`). After the fix the
+// parent Length must remain unchanged and unknown sub-TLVs must be silently
+// skipped without affecting the parsing of known sub-TLVs.
+
+func Test_LsTLVNodeDescriptor_UnknownSubTLV(t *testing.T) {
+	tests := []struct {
+		name           string
+		data           []byte
+		wantLength     uint16
+		wantSubTLVsLen int
+	}{
+		{
+			name: "trailing unknown sub-TLV",
+			data: []byte{
+				0x01, 0x00, 0x00, 0x1a, // Local Node Desc TLV, value length=26
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				0x0f, 0xff, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd, // Unknown sub-TLV (type 0x0fff): must be skipped
+			},
+			wantLength:     26,
+			wantSubTLVsLen: 2,
+		},
+		{
+			// Per RFC 7752 Section 3.2.1.4 sub-TLVs in a Node Descriptor must be in
+			// ascending order by type and have unique types, so we use two
+			// distinct unknown types in increasing order.
+			name: "two consecutive unknown sub-TLVs",
+			data: []byte{
+				0x01, 0x00, 0x00, 0x20, // Local Node Desc TLV, value length=32
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				0x0f, 0xfe, 0x00, 0x02, 0x01, 0x02, // Unknown sub-TLV #1 (type 0x0ffe): must be skipped
+				0x0f, 0xff, 0x00, 0x04, 0x03, 0x04, 0x05, 0x06, // Unknown sub-TLV #2 (type 0x0fff): must be skipped
+			},
+			wantLength:     32,
+			wantSubTLVsLen: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			tlv := &LsTLVNodeDescriptor{}
+			assert.NoError(tlv.DecodeFromBytes(tt.data))
+			// unknown sub-TLVs in the default branch.
+			assert.Equal(tt.wantLength, tlv.Length,
+				"parent TLV Length must not be mutated when skipping unknown sub-TLVs")
+			// Known sub-TLVs must still be captured.
+			assert.Len(tlv.SubTLVs, tt.wantSubTLVsLen)
+		})
+	}
+}
+
+func Test_LsLinkNLRI_UnknownSubTLV(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "trailing unknown sub-TLV",
+			data: []byte{
+				// 9-byte BGP-LS NLRI header
+				0x02,                                           // Protocol: ISIS L2
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+				// Local Node Descriptor, value length=18
+				0x01, 0x00, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				// Remote Node Descriptor, value length=18
+				0x01, 0x01, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, // TLV IGP Router ID: 0a0b.0c0d.0e0f
+				// Unknown sub-TLV (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x02, 0xaa, 0xbb,
+			},
+		},
+		{
+			name: "two consecutive unknown sub-TLVs",
+			data: []byte{
+				// 9-byte BGP-LS NLRI header
+				0x02,                                           // Protocol: ISIS L2
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+				// Local Node Descriptor, value length=18
+				0x01, 0x00, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				// Remote Node Descriptor, value length=18
+				0x01, 0x01, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, // TLV IGP Router ID: 0a0b.0c0d.0e0f
+				// Unknown sub-TLV #1 (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x02, 0xaa, 0xbb,
+				// Unknown sub-TLV #2 (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			nlri := &LsLinkNLRI{}
+			// LsAddrPrefix.DecodeFromBytes normally sets Length to the full body size.
+			nlri.Length = uint16(len(tt.data))
+			originalLength := nlri.Length
+			assert.NoError(nlri.DecodeFromBytes(tt.data))
+			assert.Equal(originalLength, nlri.Length,
+				"LsLinkNLRI.Length must not be mutated by unknown sub-TLV skipping")
+			// Required known sub-TLVs must still be parsed.
+			assert.NotNil(nlri.LocalNodeDesc)
+			assert.NotNil(nlri.RemoteNodeDesc)
+		})
+	}
+}
+
+func Test_LsPrefixV4NLRI_UnknownSubTLV(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "trailing unknown sub-TLV",
+			data: []byte{
+				// 9-byte BGP-LS NLRI header
+				0x02,                                           // Protocol: ISIS L2
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+				// Local Node Descriptor, value length=18
+				0x01, 0x00, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				// IP Reachability Info, value length=4: prefix-len=24, prefix=10.0.0
+				0x01, 0x09, 0x00, 0x04, 0x18, 0x0a, 0x00, 0x00,
+				// Unknown sub-TLV (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x02, 0xaa, 0xbb,
+			},
+		},
+		{
+			name: "two consecutive unknown sub-TLVs",
+			data: []byte{
+				// 9-byte BGP-LS NLRI header
+				0x02,                                           // Protocol: ISIS L2
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+				// Local Node Descriptor, value length=18
+				0x01, 0x00, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				// IP Reachability Info, value length=4: prefix-len=24, prefix=10.0.0
+				0x01, 0x09, 0x00, 0x04, 0x18, 0x0a, 0x00, 0x00,
+				// Unknown sub-TLV #1 (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x02, 0xaa, 0xbb,
+				// Unknown sub-TLV #2 (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			nlri := &LsPrefixV4NLRI{}
+			nlri.Length = uint16(len(tt.data))
+			originalLength := nlri.Length
+			assert.NoError(nlri.DecodeFromBytes(tt.data))
+			assert.Equal(originalLength, nlri.Length,
+				"LsPrefixV4NLRI.Length must not be mutated by unknown sub-TLV skipping")
+			assert.NotNil(nlri.LocalNodeDesc)
+			assert.NotEmpty(nlri.PrefixDesc)
+		})
+	}
+}
+
+func Test_LsPrefixV6NLRI_UnknownSubTLV(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "trailing unknown sub-TLV",
+			data: []byte{
+				// 9-byte BGP-LS NLRI header
+				0x02,                                           // Protocol: ISIS L2
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+				// Local Node Descriptor, value length=18
+				0x01, 0x00, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				// IP Reachability Info, value length=9: prefix-len=64, prefix=2001:db8::/64
+				0x01, 0x09, 0x00, 0x09,
+				0x40,
+				0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+				// Unknown sub-TLV (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x02, 0xaa, 0xbb,
+			},
+		},
+		{
+			name: "two consecutive unknown sub-TLVs",
+			data: []byte{
+				// 9-byte BGP-LS NLRI header
+				0x02,                                           // Protocol: ISIS L2
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+				// Local Node Descriptor, value length=18
+				0x01, 0x00, 0x00, 0x12,
+				0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07, // TLV ASN: 117901063
+				0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // TLV IGP Router ID: 0102.0304.0506
+				// IP Reachability Info, value length=9: prefix-len=64, prefix=2001:db8::/64
+				0x01, 0x09, 0x00, 0x09,
+				0x40,
+				0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+				// Unknown sub-TLV #1 (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x02, 0xaa, 0xbb,
+				// Unknown sub-TLV #2 (type 0x0fff): must be skipped
+				0x0f, 0xff, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			nlri := &LsPrefixV6NLRI{}
+			nlri.Length = uint16(len(tt.data))
+			originalLength := nlri.Length
+			assert.NoError(nlri.DecodeFromBytes(tt.data))
+			assert.Equal(originalLength, nlri.Length,
+				"LsPrefixV6NLRI.Length must not be mutated by unknown sub-TLV skipping")
+			assert.NotNil(nlri.LocalNodeDesc)
+			assert.NotEmpty(nlri.PrefixDesc)
+		})
+	}
+}
+
+// mtTLVBytes builds an LS Multi-Topology ID sub-TLV (RFC 7752 Section 3.2.1.5,
+// type 263) carrying the given MT-IDs. Used by the table-driven tests below
+// to compose synthetic NLRI payloads.
+func mtTLVBytes(ids ...uint16) []byte {
+	out := []byte{0x01, 0x07, 0x00, byte(2 * len(ids))}
+	for _, id := range ids {
+		out = append(out, byte(id>>8), byte(id))
+	}
+	return out
+}
+
+// linkIDTLVBytes builds an LS Link Local/Remote Identifier sub-TLV
+// (RFC 7752 Table 5, type 258, length 8) carrying the supplied
+// 32-bit values. Used by the table-driven test below to compose
+// NLRI payloads that exercise the coexistence of the identifier
+// sub-TLV with the IPv4 interface/neighbor address sub-TLVs (the
+// shape RFC 9086 Section 5.2 PeerAdj-SID Link NLRI mandates).
+func linkIDTLVBytes(local, remote uint32) []byte {
+	return []byte{
+		0x01, 0x02, 0x00, 0x08,
+		byte(local >> 24), byte(local >> 16), byte(local >> 8), byte(local),
+		byte(remote >> 24), byte(remote >> 16), byte(remote >> 8), byte(remote),
+	}
+}
+
+// Test_LsLinkDescriptor_StringIncludesLinkID verifies that
+// LsLinkDescriptor.String folds the Link Local/Remote Identifier
+// sub-TLV (RFC 7752 Table 5, type 258) into its output when the
+// identifier is present alongside the IPv4 interface/neighbor
+// address sub-TLVs (types 259/260). RFC 9086 Section 5.2 mandates
+// the identifier on PeerAdj-SID Link NLRIs and lets the producer
+// also include the addresses. The two NLRI shapes (PeerNode-SID
+// with addresses only vs PeerAdj-SID with addresses plus
+// identifier) reuse the addresses but are distinct prefixes in
+// adj-RIB-in. Any caller keyed on this String form (table-layer
+// dedup, RIB walkers, log correlation) collapses the two prefixes
+// into one unless the identifier surfaces too.
+func Test_LsLinkDescriptor_StringIncludesLinkID(t *testing.T) {
+	commonHeader := []byte{
+		0x02,                                           // Protocol: ISIS L2
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+		// Local Node Descriptor, value length=18
+		0x01, 0x00, 0x00, 0x12,
+		0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07,
+		0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		// Remote Node Descriptor, value length=18
+		0x01, 0x01, 0x00, 0x12,
+		0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07,
+		0x02, 0x03, 0x00, 0x06, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		// IPv4 Interface Address: 10.0.0.1
+		0x01, 0x03, 0x00, 0x04, 0x0a, 0x00, 0x00, 0x01,
+		// IPv4 Neighbor Address: 10.0.0.2
+		0x01, 0x04, 0x00, 0x04, 0x0a, 0x00, 0x00, 0x02,
+	}
+
+	tests := []struct {
+		name         string
+		extraTLV     []byte
+		wantContains string // expected substring in String()
+		wantNoLinkID bool   // String() must NOT contain "(L:" suffix
+	}{
+		{
+			name:         "addresses only (PeerNode-SID NLRI shape)",
+			extraTLV:     nil,
+			wantContains: "10.0.0.1->10.0.0.2",
+			wantNoLinkID: true,
+		},
+		{
+			name:         "addresses + Link ID 3/0 (PeerAdj-SID NLRI shape)",
+			extraTLV:     linkIDTLVBytes(3, 0),
+			wantContains: "10.0.0.1->10.0.0.2(L:3,R:0)",
+		},
+		{
+			name:         "addresses + Link ID 1/1",
+			extraTLV:     linkIDTLVBytes(1, 1),
+			wantContains: "10.0.0.1->10.0.0.2(L:1,R:1)",
+		},
+	}
+
+	keys := make(map[string]string, len(tests))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			data := append(append([]byte{}, commonHeader...), tt.extraTLV...)
+			nlri := &LsLinkNLRI{}
+			nlri.Length = uint16(len(data))
+			assert.NoError(nlri.DecodeFromBytes(data))
+
+			desc := &LsLinkDescriptor{}
+			desc.ParseTLVs(nlri.LinkDesc)
+
+			s := desc.String()
+			assert.Contains(s, tt.wantContains)
+			if tt.wantNoLinkID {
+				assert.NotContains(s, "(L:",
+					"NLRI without Link Local/Remote Identifier must not gain (L:..,R:..) suffix")
+			}
+			keys[tt.name] = s
+		})
+	}
+
+	// Cross-case regression: every distinct NLRI shape must produce a
+	// distinct String(), or callers keyed on the human-readable form
+	// will collapse two adj-RIB-in prefixes into one.
+	t.Run("distinct Link ID sub-TLV presence yields distinct keys", func(t *testing.T) {
+		seen := make(map[string]string, len(keys))
+		for name, key := range keys {
+			if other, ok := seen[key]; ok {
+				t.Fatalf("key collision: %q and %q both produced %q", name, other, key)
+			}
+			seen[key] = name
+		}
+	})
+}
+
+// Test_LsLinkNLRI_MultiTopoID verifies that the Multi-Topology ID sub-TLV
+// (RFC 7752 Section 3.2.1.5, type 263) is parsed into LinkDesc, that
+// LsLinkDescriptor.String() emits the MT-ID suffix, and that two
+// otherwise-identical link NLRIs with different MT-IDs produce different
+// destination keys (regression test for RIB collision via implicit-withdraw).
+func Test_LsLinkNLRI_MultiTopoID(t *testing.T) {
+	commonHeader := []byte{
+		0x02,                                           // Protocol: ISIS L2
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+		// Local Node Descriptor, value length=18
+		0x01, 0x00, 0x00, 0x12,
+		0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07,
+		0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		// Remote Node Descriptor, value length=18
+		0x01, 0x01, 0x00, 0x12,
+		0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07,
+		0x02, 0x03, 0x00, 0x06, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		// IPv4 Interface Address: 10.0.0.1
+		0x01, 0x03, 0x00, 0x04, 0x0a, 0x00, 0x00, 0x01,
+		// IPv4 Neighbor Address: 10.0.0.2
+		0x01, 0x04, 0x00, 0x04, 0x0a, 0x00, 0x00, 0x02,
+	}
+
+	tests := []struct {
+		name         string
+		extraTLV     []byte
+		wantMTIDs    map[uint16]struct{}
+		wantContains string // expected substring in LsLinkDescriptor.String()
+		wantNoMT     bool   // String() must NOT contain "MT:"
+	}{
+		{
+			name:     "no MT-ID (backward compat)",
+			extraTLV: nil,
+			wantNoMT: true,
+		},
+		{
+			name:     "single MT-ID 0",
+			extraTLV: mtTLVBytes(0),
+			wantMTIDs: map[uint16]struct{}{
+				0: {},
+			},
+			wantContains: " MT: [0]",
+		},
+		{
+			name:     "single MT-ID 2",
+			extraTLV: mtTLVBytes(2),
+			wantMTIDs: map[uint16]struct{}{
+				2: {},
+			},
+			wantContains: " MT: [2]",
+		},
+		{
+			name:     "multiple MT-IDs",
+			extraTLV: mtTLVBytes(1, 2),
+			wantMTIDs: map[uint16]struct{}{
+				1: {},
+				2: {},
+			},
+			wantContains: " MT: [1 2]",
+		},
+	}
+
+	// Track per-case String() outputs to assert that distinct MT sets yield
+	// distinct destination keys (RIB collision regression).
+	keys := make(map[string]string, len(tests))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			data := append(append([]byte{}, commonHeader...), tt.extraTLV...)
+			nlri := &LsLinkNLRI{}
+			nlri.Length = uint16(len(data))
+			assert.NoError(nlri.DecodeFromBytes(data))
+
+			desc := &LsLinkDescriptor{}
+			desc.ParseTLVs(nlri.LinkDesc)
+
+			assert.Equal(tt.wantMTIDs, desc.MultiTopoIDs)
+
+			s := desc.String()
+			if tt.wantNoMT {
+				assert.NotContains(s, "MT:",
+					"non-MT NLRI must not gain an MT suffix (backward compat)")
+			} else {
+				assert.Contains(s, tt.wantContains)
+			}
+			keys[tt.name] = s
+		})
+	}
+
+	// Cross-case regression: every distinct case must produce a distinct key.
+	t.Run("distinct MT sets yield distinct keys", func(t *testing.T) {
+		seen := make(map[string]string, len(keys))
+		for name, key := range keys {
+			if other, ok := seen[key]; ok {
+				t.Fatalf("RIB key collision: %q and %q both produced %q", name, other, key)
+			}
+			seen[key] = name
+		}
+	})
+}
+
+func Test_LsPrefixV4NLRI_MultiTopoID(t *testing.T) {
+	commonHeader := []byte{
+		0x02,                                           // Protocol: ISIS L2
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+		0x01, 0x00, 0x00, 0x12,
+		0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07,
+		0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		// IP Reachability Info: prefix-len=24, prefix=10.0.0.0/24
+		0x01, 0x09, 0x00, 0x04, 0x18, 0x0a, 0x00, 0x00,
+	}
+
+	tests := []struct {
+		name         string
+		extraTLV     []byte
+		wantMTIDs    map[uint16]struct{}
+		wantContains string
+		wantNoMT     bool
+	}{
+		{
+			name:     "no MT-ID (backward compat)",
+			extraTLV: nil,
+			wantNoMT: true,
+		},
+		{
+			name:     "single MT-ID 2",
+			extraTLV: mtTLVBytes(2),
+			wantMTIDs: map[uint16]struct{}{
+				2: {},
+			},
+			wantContains: " MT: [2]",
+		},
+		{
+			name:     "multiple MT-IDs",
+			extraTLV: mtTLVBytes(0, 2),
+			wantMTIDs: map[uint16]struct{}{
+				0: {},
+				2: {},
+			},
+			wantContains: " MT: [0 2]",
+		},
+	}
+
+	keys := make(map[string]string, len(tests))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			data := append(append([]byte{}, commonHeader...), tt.extraTLV...)
+			nlri := &LsPrefixV4NLRI{}
+			nlri.Length = uint16(len(data))
+			assert.NoError(nlri.DecodeFromBytes(data))
+
+			pd := &LsPrefixDescriptor{}
+			pd.ParseTLVs(nlri.PrefixDesc, false)
+
+			assert.Equal(tt.wantMTIDs, pd.MultiTopoIDs)
+
+			s := nlri.String()
+			if tt.wantNoMT {
+				assert.NotContains(s, "MT:")
+			} else {
+				assert.Contains(s, tt.wantContains)
+			}
+			keys[tt.name] = s
+		})
+	}
+
+	// Cross-case regression: every distinct case must produce a distinct key.
+	t.Run("distinct MT sets yield distinct keys", func(t *testing.T) {
+		seen := make(map[string]string, len(keys))
+		for name, key := range keys {
+			if other, ok := seen[key]; ok {
+				t.Fatalf("RIB key collision: %q and %q both produced %q", name, other, key)
+			}
+			seen[key] = name
+		}
+	})
+}
+
+func Test_LsPrefixV6NLRI_MultiTopoID(t *testing.T) {
+	commonHeader := []byte{
+		0x02,                                           // Protocol: ISIS L2
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Identifier
+		0x01, 0x00, 0x00, 0x12,
+		0x02, 0x00, 0x00, 0x04, 0x07, 0x07, 0x07, 0x07,
+		0x02, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		// IP Reachability Info: prefix-len=64, prefix=2001:db8::/64
+		0x01, 0x09, 0x00, 0x09,
+		0x40,
+		0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	tests := []struct {
+		name         string
+		extraTLV     []byte
+		wantMTIDs    map[uint16]struct{}
+		wantContains string
+		wantNoMT     bool
+	}{
+		{
+			name:     "no MT-ID (backward compat)",
+			extraTLV: nil,
+			wantNoMT: true,
+		},
+		{
+			name:     "single MT-ID 2",
+			extraTLV: mtTLVBytes(2),
+			wantMTIDs: map[uint16]struct{}{
+				2: {},
+			},
+			wantContains: " MT: [2]",
+		},
+		{
+			name:     "multiple MT-IDs",
+			extraTLV: mtTLVBytes(0, 2),
+			wantMTIDs: map[uint16]struct{}{
+				0: {},
+				2: {},
+			},
+			wantContains: " MT: [0 2]",
+		},
+	}
+
+	keys := make(map[string]string, len(tests))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			data := append(append([]byte{}, commonHeader...), tt.extraTLV...)
+			nlri := &LsPrefixV6NLRI{}
+			nlri.Length = uint16(len(data))
+			assert.NoError(nlri.DecodeFromBytes(data))
+
+			pd := &LsPrefixDescriptor{}
+			pd.ParseTLVs(nlri.PrefixDesc, true)
+
+			assert.Equal(tt.wantMTIDs, pd.MultiTopoIDs)
+
+			s := nlri.String()
+			if tt.wantNoMT {
+				assert.NotContains(s, "MT:")
+			} else {
+				assert.Contains(s, tt.wantContains)
+			}
+			keys[tt.name] = s
+		})
+	}
+
+	// Cross-case regression: every distinct case must produce a distinct key.
+	t.Run("distinct MT sets yield distinct keys", func(t *testing.T) {
+		seen := make(map[string]string, len(keys))
+		for name, key := range keys {
+			if other, ok := seen[key]; ok {
+				t.Fatalf("RIB key collision: %q and %q both produced %q", name, other, key)
+			}
+			seen[key] = name
+		}
+	})
+}
+
+// NewLsPrefixTLVs must not append a TLV it could not build. Storing a typed nil
+// pointer in the LsTLVInterface slice makes the element compare non-nil and
+// panics on every later use of the NLRI, so an unusable prefix is skipped.
+func Test_NewLsPrefixTLVsInvalidPrefix(t *testing.T) {
+	assert := assert.New(t)
+
+	valid := netip.MustParsePrefix("10.1.0.0/24")
+	pd := &LsPrefixDescriptor{
+		IPReachability: []netip.Prefix{{}, valid, netip.PrefixFrom(valid.Addr(), 33)},
+	}
+
+	tlvs := NewLsPrefixTLVs(pd)
+	assert.Len(tlvs, 1)
+	for _, tlv := range tlvs {
+		assert.NotNil(tlv)
+		reach, ok := tlv.(*LsTLVIPReachability)
+		if assert.True(ok) {
+			assert.NotNil(reach)
+		}
+	}
+
+	// The surviving TLV must still render and serialize.
+	nlri := &LsPrefixV4NLRI{LocalNodeDesc: &LsTLVNodeDescriptor{}, PrefixDesc: tlvs}
+	assert.Contains(nlri.String(), "10.1.0.0/24")
+	_, err := nlri.Serialize()
+	assert.NoError(err)
+}
+
+// getBGPUpdateAttributes was handed the attributes and the NLRI field together,
+// and it walks whatever it is given as a chain of attribute headers. Once it ran
+// off the end of the declared attribute region it read the NLRI as [flags][type]
+// [len] triplets, so a prefix in 40.0.0.0/8 registered BGP_ATTR_TYPE_PREFIX_SID
+// as present. MPLSLabelStack.DecodeFromBytes keys the bottom-of-stack rule off
+// that flag, so the same labeled prefix decodes differently depending on an
+// unrelated NLRI the peer chose.
+func Test_UpdateAttributeScanStopsAtDeclaredLength(t *testing.T) {
+	update := func(nlri []byte) []byte {
+		// MP_REACH: IPv4 labeled unicast, 10.0.0.0/8 behind a two-label stack.
+		mp := []byte{0x00, 0x01, 0x04, 0x04, 192, 0, 2, 1, 0x00}
+		mp = append(mp, 8+8*6)            // prefix bits, labels included
+		mp = append(mp, 0x00, 0x01, 0x00) // label 16, bottom-of-stack clear
+		mp = append(mp, 0x00, 0x02, 0x11) // label 33, bottom-of-stack set
+		mp = append(mp, 0x0a)             // 10.0.0.0/8
+
+		attrs := []byte{0x40, 0x01, 0x01, 0x00} // ORIGIN igp
+		attrs = append(attrs, 0x80, byte(BGP_ATTR_TYPE_MP_REACH_NLRI), byte(len(mp)))
+		attrs = append(attrs, mp...)
+
+		body := []byte{0x00, 0x00} // no withdrawn routes
+		body = binary.BigEndian.AppendUint16(body, uint16(len(attrs)))
+		body = append(body, attrs...)
+		body = append(body, nlri...)
+
+		buf := bytes.Repeat([]byte{0xff}, 16)
+		buf = binary.BigEndian.AppendUint16(buf, uint16(BGP_HEADER_LENGTH+len(body)))
+		buf = append(buf, BGP_MSG_UPDATE)
+		return append(buf, body...)
+	}
+
+	labeled := func(t *testing.T, data []byte) *LabeledIPAddrPrefix {
+		t.Helper()
+		msg, err := ParseBGPMessage(data)
+		require.NoError(t, err)
+		for _, attr := range msg.Body.(*BGPUpdate).PathAttributes {
+			if mp, ok := attr.(*PathAttributeMpReachNLRI); ok {
+				require.Len(t, mp.Value, 1)
+				return mp.Value[0].NLRI.(*LabeledIPAddrPrefix)
+			}
+		}
+		t.Fatal("no MP_REACH_NLRI in the decoded UPDATE")
+		return nil
+	}
+
+	// 0x18 0xc0 0x00 0x02 -> 192.0.2.0/24, type byte 0xc0
+	want := labeled(t, update([]byte{0x18, 192, 0, 2}))
+	// 0x18 0x28 0x01 0x02 -> 40.1.2.0/24, type byte 0x28 == BGP_ATTR_TYPE_PREFIX_SID
+	got := labeled(t, update([]byte{0x18, 40, 1, 2}))
+
+	assert.Equal(t, "10.0.0.0/8", want.Prefix.String())
+	assert.Equal(t, want.Prefix, got.Prefix)
+	assert.Equal(t, want.Labels.Labels, got.Labels.Labels)
+}
+
+func PerfCaseExtCommRouteTargetKey(b *testing.B) {
+	rt, _ := ParseRouteTarget("65000:100")
+	b.ResetTimer()
+	for range b.N {
+		_, _ = ExtCommRouteTargetKey(rt)
+	}
+}
+
+type capabilityTestCase struct {
+	name string
+	cap  ParameterCapabilityInterface
+}
+
+// capabilityLenTestCases returns one capability of every type. Add every new
+// capability type here.
+func capabilityLenTestCases() []capabilityTestCase {
+	return []capabilityTestCase{
+		{"multi-protocol", NewCapMultiProtocol(RF_IPv6_UC)},
+		{"route-refresh", NewCapRouteRefresh()},
+		{"extended-message", NewCapExtendedMessage()},
+		{"carrying-label-info", NewCapCarryingLabelInfo()},
+		{"enhanced-route-refresh", NewCapEnhancedRouteRefresh()},
+		{"route-refresh-cisco", NewCapRouteRefreshCisco()},
+		{"four-octet-as", NewCapFourOctetASNumber(65000)},
+		{"extended-nexthop", NewCapExtendedNexthop([]*CapExtendedNexthopTuple{
+			NewCapExtendedNexthopTuple(RF_IPv4_UC, uint16(AFI_IP6)),
+			NewCapExtendedNexthopTuple(RF_IPv4_VPN, uint16(AFI_IP6)),
+		})},
+		{"graceful-restart", NewCapGracefulRestart(true, true, 120, []*CapGracefulRestartTuple{
+			NewCapGracefulRestartTuple(RF_IPv4_UC, true),
+			NewCapGracefulRestartTuple(RF_IPv6_UC, false),
+		})},
+		{"add-path", NewCapAddPath([]*CapAddPathTuple{
+			NewCapAddPathTuple(RF_IPv4_UC, BGP_ADD_PATH_BOTH),
+		})},
+		{"llgr", NewCapLongLivedGracefulRestart([]*CapLongLivedGracefulRestartTuple{
+			NewCapLongLivedGracefulRestartTuple(RF_IPv4_UC, true, 3600),
+			NewCapLongLivedGracefulRestartTuple(RF_IPv6_UC, false, 10),
+		})},
+		{"fqdn", NewCapFQDN("router1", "example.com")},
+		{"software-version", NewCapSoftwareVersion("GoBGP/4.0.0")},
+		{"unknown", NewCapUnknown(BGPCapabilityCode(199), []byte{0x11, 0x22, 0x33})},
+	}
+}
+
+// TestCapabilityLenMatchesSerialize checks the invariant documented on
+// DefaultParameterCapability.Len.
+func TestCapabilityLenMatchesSerialize(t *testing.T) {
+	for _, tt := range capabilityLenTestCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			// Len must be right before Serialize has ever run. It used to
+			// return 2 until Serialize filled CapLen as a side effect.
+			l := tt.cap.Len()
+			buf, err := tt.cap.Serialize()
+			require.NoError(t, err)
+			require.Equal(t, len(buf), l)
+		})
+	}
+}
+
+func TestOptionParameterCapabilityAdvancesByWireLength(t *testing.T) {
+	// The graceful restart capability carries 6 octets of value where only
+	// the first 4 form a complete tuple. The decoder drops the trailing 2,
+	// so the capability serializes back 2 octets shorter than it arrived.
+	// The parse loop must still find the capability that follows it.
+	openBytes := []byte{
+		0x04,       // version: 4
+		0xfa, 0x7b, // my as: 64123
+		0x00, 0xf0, // hold time: 240 seconds
+		0x7f, 0x00, 0x00, 0x02, // BGP identifier: 127.0.0.2
+		0x12, // optional parameters length: 18
+		0x02, // parameter type: capability
+		0x10, // parameter length: 16
+
+		0x40,       // capability type: graceful restart
+		0x08,       // capability length: 8
+		0x00, 0x78, // flags: 0, time: 120
+		0x00, 0x01, 0x01, 0x80, // AFI: IPv4, SAFI: unicast, flags: forwarding preserved
+		0x00, 0x01, // trailing partial tuple
+
+		0x41,                   // capability type: 4-octet AS
+		0x04,                   // capability length: 4
+		0x00, 0x00, 0xfd, 0xe8, // AS 65000
+	}
+
+	open := &BGPOpen{}
+	require.NoError(t, open.DecodeFromBytes(openBytes))
+
+	require.Len(t, open.OptParams, 1)
+	param, ok := open.OptParams[0].(*OptionParameterCapability)
+	require.True(t, ok)
+	require.Len(t, param.Capability, 2)
+
+	gr, ok := param.Capability[0].(*CapGracefulRestart)
+	require.True(t, ok)
+	require.Len(t, gr.Tuples, 1)
+	// 10 octets arrived, 8 go back out.
+	require.Equal(t, 8, gr.Len())
+
+	as4, ok := param.Capability[1].(*CapFourOctetASNumber)
+	require.True(t, ok)
+	require.Equal(t, uint32(65000), as4.CapValue)
+}
+
+// capBase returns a copy of the embedded DefaultParameterCapability, which is
+// the only part of a capability that Serialize used to write to.
+func capBase(t *testing.T, c ParameterCapabilityInterface) DefaultParameterCapability {
+	t.Helper()
+	f := reflect.ValueOf(c).Elem().FieldByName("DefaultParameterCapability")
+	require.True(t, f.IsValid(), "capability has no embedded DefaultParameterCapability")
+	return f.Interface().(DefaultParameterCapability)
+}
+
+// TestCapabilitySerializeDoesNotModify checks that Serialize leaves the
+// capability alone. A capability decoded from a peer OPEN is shared by the
+// FSM, the gRPC API and the BMP clients, which serialize it concurrently.
+// Add every new capability type here.
+func TestCapabilitySerializeDoesNotModify(t *testing.T) {
+	for _, tt := range capabilityLenTestCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			before := capBase(t, tt.cap)
+			for range 2 {
+				_, err := tt.cap.Serialize()
+				require.NoError(t, err)
+				require.Equal(t, before, capBase(t, tt.cap))
+			}
+		})
+	}
+}
+
+// TestBGPOpenSerializeDoesNotModify checks that serializing an OPEN leaves the
+// message alone. recvOpen is shared by the FSM, the gRPC API and the BMP
+// clients, which serialize it from their own goroutines.
+func TestBGPOpenSerializeDoesNotModify(t *testing.T) {
+	m, err := NewBGPOpenMessage(65001, 90, netip.MustParseAddr("10.0.0.1"),
+		[]OptionParameterInterface{
+			NewOptionParameterCapability([]ParameterCapabilityInterface{
+				NewCapMultiProtocol(RF_IPv4_UC),
+				NewCapRouteRefresh(),
+				NewCapFourOctetASNumber(65000),
+			}),
+			&OptionParameterUnknown{ParamType: 0xfe, Value: []byte{0x01, 0x02}},
+		})
+	require.NoError(t, err)
+	open := m.Body.(*BGPOpen)
+
+	lengths := func() []uint8 {
+		out := []uint8{open.OptParamLen}
+		for _, p := range open.OptParams {
+			switch o := p.(type) {
+			case *OptionParameterCapability:
+				out = append(out, o.ParamLen)
+			case *OptionParameterUnknown:
+				out = append(out, o.ParamLen)
+			}
+		}
+		return out
+	}
+
+	before := lengths()
+	require.Equal(t, []uint8{0, 0, 0}, before, "nothing is set before Serialize")
+
+	buf1, err := open.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, before, lengths())
+
+	buf2, err := open.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, buf1, buf2)
+	require.Equal(t, before, lengths())
+
+	// The lengths still have to reach the wire.
+	decoded := &BGPOpen{}
+	require.NoError(t, decoded.DecodeFromBytes(buf1))
+	require.Equal(t, uint8(len(buf1)-10), decoded.OptParamLen)
+	require.Len(t, decoded.OptParams, 2)
+	capParam, ok := decoded.OptParams[0].(*OptionParameterCapability)
+	require.True(t, ok)
+	require.Len(t, capParam.Capability, 3)
+	unknown, ok := decoded.OptParams[1].(*OptionParameterUnknown)
+	require.True(t, ok)
+	require.Equal(t, uint8(2), unknown.ParamLen)
+	require.Equal(t, []byte{0x01, 0x02}, unknown.Value)
+}
+
+// TestOptionParameterUnknownKeepsExplicitParamLen checks that an explicitly set
+// ParamLen still wins over len(Value).
+func TestOptionParameterUnknownKeepsExplicitParamLen(t *testing.T) {
+	o := &OptionParameterUnknown{ParamType: 0xfe, ParamLen: 4, Value: []byte{0x01, 0x02}}
+	buf, err := o.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, uint8(4), buf[1])
+	require.Equal(t, uint8(4), o.ParamLen)
+}
+
+// TestBGPMessageSerializeDoesNotModifyHeader checks that serializing a message
+// built in memory does not cache the length in the header. SentOpen is built
+// once per peer event and handed to every BMP client, which serialize it from
+// their own goroutines.
+func TestBGPMessageSerializeDoesNotModifyHeader(t *testing.T) {
+	m, err := NewBGPOpenMessage(65001, 90, netip.MustParseAddr("10.0.0.1"),
+		[]OptionParameterInterface{
+			NewOptionParameterCapability([]ParameterCapabilityInterface{
+				NewCapMultiProtocol(RF_IPv4_UC),
+			}),
+		})
+	require.NoError(t, err)
+	require.Equal(t, uint16(0), m.Header.Len)
+
+	buf1, err := m.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, uint16(0), m.Header.Len, "Serialize must not cache the length")
+	require.Equal(t, uint16(len(buf1)), binary.BigEndian.Uint16(buf1[16:18]))
+
+	buf2, err := m.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, buf1, buf2)
+	require.Equal(t, uint16(0), m.Header.Len)
+
+	// A message read off the wire keeps the length it arrived with.
+	m2, err := ParseBGPMessage(buf1)
+	require.NoError(t, err)
+	require.Equal(t, uint16(len(buf1)), m2.Header.Len)
+	buf3, err := m2.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, buf1, buf3)
+	require.Equal(t, uint16(len(buf1)), m2.Header.Len)
+}
+
+// TestBGPMessageSerializeRechecksLength checks that the message size limit is
+// applied on every call. It used to be skipped once the header had a length.
+func TestBGPMessageSerializeRechecksLength(t *testing.T) {
+	body := &BGPNotification{
+		ErrorCode:    BGP_ERROR_CEASE,
+		ErrorSubcode: 0,
+		Data:         bytes.Repeat([]byte{0xCC}, 5000),
+	}
+	m := &BGPMessage{
+		Header: BGPHeader{Type: BGP_MSG_NOTIFICATION},
+		Body:   body,
+	}
+	// A successful extended serialisation used to cache the length in the
+	// header, which made every later call skip the cap.
+	_, err := m.Serialize(&MarshallingOption{ExtendedMessage: true})
+	require.NoError(t, err)
+
+	_, err = m.Serialize()
+	require.Error(t, err, "the cap must be applied on every call")
+
+	_, err = m.Serialize(&MarshallingOption{ExtendedMessage: true})
+	require.NoError(t, err)
+}
+
+// TestSerializeIsConcurrencySafe serializes one OPEN, and the capabilities
+// inside it, from several goroutines at once.
+//
+// The FSM keeps the OPEN it received in fsm.recvOpen and hands the same
+// pointer to every BMP client through watchEventPeer.RecvOpen, while toConfig
+// serializes it for the gRPC API. The capabilities travel the same way in
+// RemoteCap, and the OPEN that buildopen builds travels in SentOpen. So one
+// message is serialized by several goroutines with no lock between them.
+//
+// Run with: go test -race -count=1 ./pkg/packet/bgp/ -run TestSerializeIsConcurrencySafe
+func TestSerializeIsConcurrencySafe(t *testing.T) {
+	sent, err := NewBGPOpenMessage(65001, 90, netip.MustParseAddr("10.0.0.1"),
+		[]OptionParameterInterface{
+			NewOptionParameterCapability([]ParameterCapabilityInterface{
+				NewCapMultiProtocol(RF_IPv4_UC),
+				NewCapMultiProtocol(RF_IPv6_UC),
+				NewCapRouteRefresh(),
+				NewCapFourOctetASNumber(65001),
+				NewCapGracefulRestart(true, true, 120, []*CapGracefulRestartTuple{
+					NewCapGracefulRestartTuple(RF_IPv4_UC, true),
+				}),
+				NewCapAddPath([]*CapAddPathTuple{
+					NewCapAddPathTuple(RF_IPv4_UC, BGP_ADD_PATH_BOTH),
+				}),
+				NewCapFQDN("router1", "example.com"),
+				NewCapSoftwareVersion("GoBGP"),
+			}),
+			&OptionParameterUnknown{ParamType: 0xfe, Value: []byte{0x01, 0x02}},
+		})
+	require.NoError(t, err)
+
+	// wire is what goes out, and what a peer sends us.
+	wire, err := sent.Serialize()
+	require.NoError(t, err)
+
+	// recv stands in for fsm.recvOpen.
+	recv, err := ParseBGPMessage(wire)
+	require.NoError(t, err)
+
+	type target struct {
+		name string
+		want []byte
+		run  func() ([]byte, error)
+	}
+	targets := []target{
+		{"recv-open", wire, func() ([]byte, error) { return recv.Serialize() }},
+		{"sent-open", wire, func() ([]byte, error) { return sent.Serialize() }},
+	}
+
+	// The capabilities stand in for watchEventPeer.RemoteCap, which carries
+	// the objects decoded from the peer OPEN, not copies of them.
+	for _, p := range recv.Body.(*BGPOpen).OptParams {
+		o, ok := p.(*OptionParameterCapability)
+		if !ok {
+			continue
+		}
+		for _, c := range o.Capability {
+			want, err := c.Serialize()
+			require.NoError(t, err)
+			targets = append(targets, target{
+				name: "cap-" + strconv.Itoa(int(c.Code())),
+				want: want,
+				run:  c.Serialize,
+			})
+		}
+	}
+	require.Len(t, targets, 10)
+
+	const goroutines = 8
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	for _, tt := range targets {
+		for range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range iterations {
+					got, err := tt.run()
+					if err != nil {
+						t.Errorf("%s: %v", tt.name, err)
+						return
+					}
+					if !bytes.Equal(got, tt.want) {
+						t.Errorf("%s: serialized bytes differ between goroutines", tt.name)
+						return
+					}
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+// bgpMessageHeader builds the 19-octet on-the-wire BGP header: an all-ones
+// marker, the declared total message length, then the type. The body is left
+// out because BGPHeader.DecodeFromBytes reads nothing beyond these 19 octets.
+func bgpMessageHeader(msgType uint8, declaredLen uint16) []byte {
+	buf := make([]byte, BGP_HEADER_LENGTH)
+	for i := range buf[:16] {
+		buf[i] = 0xff
+	}
+	binary.BigEndian.PutUint16(buf[16:18], declaredLen)
+	buf[18] = msgType
+	return buf
+}
+
+// TestMessageHeaderErrorData pins RFC 4271 Section 6.1: a Bad Message Length
+// NOTIFICATION must carry the erroneous Length field, and a Bad Message Type
+// NOTIFICATION must carry the erroneous Type field. Both used to be sent with
+// an empty Data field.
+func TestMessageHeaderErrorData(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []byte
+		subCode uint8
+		data    []byte
+	}{
+		{
+			name:    "length below the header length",
+			input:   bgpMessageHeader(BGP_MSG_KEEPALIVE, BGP_HEADER_LENGTH-1),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_LENGTH,
+			data:    []byte{0x00, 0x12},
+		},
+		{
+			name:    "zero length",
+			input:   bgpMessageHeader(BGP_MSG_KEEPALIVE, 0),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_LENGTH,
+			data:    []byte{0x00, 0x00},
+		},
+		{
+			name:    "unknown message type",
+			input:   bgpMessageHeader(BGP_MSG_ROUTE_REFRESH+1, BGP_HEADER_LENGTH),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_TYPE,
+			data:    []byte{BGP_MSG_ROUTE_REFRESH + 1},
+		},
+		{
+			name:    "message type zero",
+			input:   bgpMessageHeader(0, BGP_HEADER_LENGTH),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_TYPE,
+			data:    []byte{0x00},
+		},
+		{
+			// The declared length may be legal. The caller just did
+			// not hand over that many bytes. The subcode still says
+			// Bad Message Length, so the length has to be there.
+			name:    "fewer bytes than the declared length",
+			input:   bgpMessageHeader(BGP_MSG_UPDATE, 30),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_LENGTH,
+			data:    []byte{0x00, 0x1e},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseBGPMessage(tt.input)
+			require.Error(t, err)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, tt.subCode, me.SubTypeCode)
+			require.Equal(t, tt.data, me.Data)
+		})
+	}
+}
+
+// TestParseBGPBodyShortBodyErrorData covers the same RFC 4271 Section 6.1 rule
+// on the path the FSM uses. ParseBGPBody is handed the header separately, so
+// it is the header length that goes in the Data field.
+func TestParseBGPBodyShortBodyErrorData(t *testing.T) {
+	h := &BGPHeader{}
+	require.NoError(t, h.DecodeFromBytes(bgpMessageHeader(BGP_MSG_UPDATE, 30)))
+
+	_, err := ParseBGPBody(h, make([]byte, 5))
+	require.Error(t, err)
+
+	var me *MessageError
+	require.ErrorAs(t, err, &me)
+	require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+	require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+	require.Equal(t, []byte{0x00, 0x1e}, me.Data)
+}
+
+// TestParseBGPMessageKeepAliveLength pins RFC 4271 Section 4.4: a KEEPALIVE is
+// header-only, so anything other than 19 octets is malformed. The decoder used
+// to accept any length and return a non-nil message with a nil error.
+func TestParseBGPMessageKeepAliveLength(t *testing.T) {
+	t.Run("exactly 19 accepted", func(t *testing.T) {
+		m, err := ParseBGPMessage(bgpMessageHeader(BGP_MSG_KEEPALIVE, BGP_HEADER_LENGTH))
+		require.NoError(t, err)
+		require.Equal(t, uint8(BGP_MSG_KEEPALIVE), m.Header.Type)
+	})
+
+	for _, declaredLen := range []uint16{20, 100, BGP_MAX_MESSAGE_LENGTH} {
+		t.Run(fmt.Sprintf("length %d rejected", declaredLen), func(t *testing.T) {
+			buf := append(bgpMessageHeader(BGP_MSG_KEEPALIVE, declaredLen),
+				make([]byte, int(declaredLen)-BGP_HEADER_LENGTH)...)
+			_, err := ParseBGPMessage(buf)
+			require.Error(t, err, "KEEPALIVE with length %d must be rejected", declaredLen)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+			require.Equal(t, binary.BigEndian.AppendUint16(nil, declaredLen), me.Data)
+		})
+	}
+}
+
+// TestParseBGPBodyLengthMismatch pins the parseBody contract: data must hold
+// exactly the body the header declares. A longer slice used to reach the body
+// decoders, which read the extra bytes as part of the message: an UPDATE gained
+// NLRI that was never sent, and a conforming KEEPALIVE was rejected with a
+// length that was never on the wire.
+func TestParseBGPBodyLengthMismatch(t *testing.T) {
+	tests := []struct {
+		name        string
+		msgType     uint8
+		declaredLen uint16
+		bodyLen     int
+	}{
+		{name: "update with trailing bytes", msgType: BGP_MSG_UPDATE, declaredLen: 23, bodyLen: 8},
+		{name: "keepalive with a body", msgType: BGP_MSG_KEEPALIVE, declaredLen: BGP_HEADER_LENGTH, bodyLen: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &BGPHeader{}
+			require.NoError(t, h.DecodeFromBytes(bgpMessageHeader(tt.msgType, tt.declaredLen)))
+
+			_, err := ParseBGPBody(h, make([]byte, tt.bodyLen))
+			require.Error(t, err)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+			require.Equal(t, binary.BigEndian.AppendUint16(nil, tt.declaredLen), me.Data)
+		})
+	}
+}
+
+// TestParseBodyMessageLengthErrorData pins the per-type length rules of RFC
+// 4271 Section 6.1: a message below the minimum length of its type is Bad
+// Message Length, and the Data field must carry the erroneous Length field.
+// The checks used to live in the body decoders, which do not know the declared
+// length, so the Data field was empty or held a length that was never sent.
+func TestParseBodyMessageLengthErrorData(t *testing.T) {
+	tests := []struct {
+		name    string
+		msgType uint8
+		bodyLen int
+	}{
+		{name: "open below the minimum length", msgType: BGP_MSG_OPEN, bodyLen: 9},
+		{name: "update below the minimum length", msgType: BGP_MSG_UPDATE, bodyLen: 3},
+		{name: "notification below the minimum length", msgType: BGP_MSG_NOTIFICATION, bodyLen: 1},
+		{name: "keepalive with a body", msgType: BGP_MSG_KEEPALIVE, bodyLen: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declaredLen := uint16(BGP_HEADER_LENGTH + tt.bodyLen)
+			buf := append(bgpMessageHeader(tt.msgType, declaredLen), make([]byte, tt.bodyLen)...)
+
+			_, err := ParseBGPMessage(buf)
+			require.Error(t, err)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+			require.Equal(t, binary.BigEndian.AppendUint16(nil, declaredLen), me.Data)
+		})
+	}
+}
+
+// TestParseBodyRouteRefreshLengthError pins RFC 7313 Section 5: a ROUTE-REFRESH
+// of the wrong length is a ROUTE-REFRESH Message Error with the subcode Invalid
+// Message Length, not a header error, so parseBody leaves that check to the
+// body decoder.
+func TestParseBodyRouteRefreshLengthError(t *testing.T) {
+	buf := append(bgpMessageHeader(BGP_MSG_ROUTE_REFRESH, BGP_HEADER_LENGTH+3), make([]byte, 3)...)
+
+	_, err := ParseBGPMessage(buf)
+	require.Error(t, err)
+
+	var me *MessageError
+	require.ErrorAs(t, err, &me)
+	require.Equal(t, uint8(BGP_ERROR_ROUTE_REFRESH_MESSAGE_ERROR), me.TypeCode)
+	require.Equal(t, uint8(BGP_ERROR_SUB_INVALID_MESSAGE_LENGTH), me.SubTypeCode)
+}

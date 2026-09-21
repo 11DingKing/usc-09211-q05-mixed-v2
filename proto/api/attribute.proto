@@ -1,0 +1,929 @@
+// Copyright (C) 2018 Nippon Telegraph and Telephone Corporation.
+//
+// Permission is hereby granted, free of charge, to any person
+// obtaining a copy of this software and associated documentation files
+// (the "Software"), to deal in the Software without restriction,
+// including without limitation the rights to use, copy, modify, merge,
+// publish, distribute, sublicense, and/or sell copies of the Software,
+// and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+syntax = "proto3";
+
+package api;
+
+import "api/common.proto";
+import "api/extcom.proto";
+import "api/nlri.proto";
+
+option go_package = "github.com/osrg/gobgp/v4/api;api";
+
+message Attribute {
+  oneof attr {
+    UnknownAttribute unknown = 1;
+    OriginAttribute origin = 2;
+    AsPathAttribute as_path = 3;
+    NextHopAttribute next_hop = 4;
+    MultiExitDiscAttribute multi_exit_disc = 5;
+    LocalPrefAttribute local_pref = 6;
+    AtomicAggregateAttribute atomic_aggregate = 7;
+    AggregatorAttribute aggregator = 8;
+    CommunitiesAttribute communities = 9;
+    OriginatorIdAttribute originator_id = 10;
+    ClusterListAttribute cluster_list = 11;
+    MpReachNLRIAttribute mp_reach = 12;
+    MpUnreachNLRIAttribute mp_unreach = 13;
+    ExtendedCommunitiesAttribute extended_communities = 14;
+    As4PathAttribute as4_path = 15;
+    As4AggregatorAttribute as4_aggregator = 16;
+    PmsiTunnelAttribute pmsi_tunnel = 17;
+    TunnelEncapAttribute tunnel_encap = 18;
+    IP6ExtendedCommunitiesAttribute ip6_extended_communities = 19;
+    AigpAttribute aigp = 20;
+    LargeCommunitiesAttribute large_communities = 21;
+    LsAttribute ls = 22;
+    PrefixSID prefix_sid = 23;
+  }
+}
+
+message OriginAttribute {
+  uint32 origin = 1;
+}
+
+message AsSegment {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_AS_SET = 1;
+    TYPE_AS_SEQUENCE = 2;
+    TYPE_AS_CONFED_SEQUENCE = 3;
+    TYPE_AS_CONFED_SET = 4;
+  }
+  Type type = 1;
+  repeated uint32 numbers = 2;
+}
+
+message AsPathAttribute {
+  repeated AsSegment segments = 1;
+}
+
+message NextHopAttribute {
+  string next_hop = 1;
+}
+
+message MultiExitDiscAttribute {
+  uint32 med = 1;
+}
+
+message LocalPrefAttribute {
+  uint32 local_pref = 1;
+}
+
+message AtomicAggregateAttribute {}
+
+message AggregatorAttribute {
+  uint32 asn = 1;
+  string address = 2;
+}
+
+message CommunitiesAttribute {
+  repeated uint32 communities = 1;
+}
+
+message OriginatorIdAttribute {
+  string id = 1;
+}
+
+message ClusterListAttribute {
+  repeated string ids = 1;
+}
+
+message MpReachNLRIAttribute {
+  Family family = 1;
+  repeated string next_hops = 2;
+  repeated NLRI nlris = 3;
+}
+
+message MpUnreachNLRIAttribute {
+  api.Family family = 1;
+  // The same as NLRI field of MpReachNLRIAttribute
+  repeated NLRI nlris = 3;
+}
+
+message ExtendedCommunitiesAttribute {
+  repeated ExtendedCommunity communities = 1;
+}
+
+message As4PathAttribute {
+  repeated AsSegment segments = 1;
+}
+
+message As4AggregatorAttribute {
+  uint32 asn = 2;
+  string address = 3;
+}
+
+message PmsiTunnelAttribute {
+  uint32 flags = 1;
+  uint32 type = 2;
+  uint32 label = 3;
+  bytes id = 4;
+}
+
+message TunnelEncapSubTLVEncapsulation {
+  uint32 key = 1;
+  bytes cookie = 2;
+}
+
+message TunnelEncapSubTLVProtocol {
+  uint32 protocol = 1;
+}
+
+message TunnelEncapSubTLVColor {
+  uint32 color = 1;
+}
+
+message TunnelEncapSubTLVSRPreference {
+  uint32 flags = 1;
+  uint32 preference = 2;
+}
+
+message TunnelEncapSubTLVSRCandidatePathName {
+  string candidate_path_name = 1;
+}
+
+message TunnelEncapSubTLVSRPriority {
+  uint32 priority = 1;
+}
+
+message TunnelEncapSubTLVSRBindingSID {
+  oneof bsid {
+    SRBindingSID sr_binding_sid = 1;
+    SRv6BindingSID srv6_binding_sid = 2;
+  }
+}
+
+message SRBindingSID {
+  bool s_flag = 1;
+  bool i_flag = 2;
+  bytes sid = 3;
+}
+
+enum SRV6Behavior {
+  SRV6_BEHAVIOR_UNSPECIFIED = 0;
+  SRV6_BEHAVIOR_END = 1;
+  SRV6_BEHAVIOR_END_WITH_PSP = 2;
+  SRV6_BEHAVIOR_END_WITH_USP = 3;
+  SRV6_BEHAVIOR_END_WITH_PSP_USP = 4;
+  SRV6_BEHAVIOR_ENDX = 5;
+  SRV6_BEHAVIOR_ENDX_WITH_PSP = 6;
+  SRV6_BEHAVIOR_ENDX_WITH_USP = 7;
+  SRV6_BEHAVIOR_ENDX_WITH_PSP_USP = 8;
+  SRV6_BEHAVIOR_ENDT = 9;
+  SRV6_BEHAVIOR_ENDT_WITH_PSP = 10;
+  SRV6_BEHAVIOR_ENDT_WITH_USP = 11;
+  SRV6_BEHAVIOR_ENDT_WITH_PSP_USP = 12;
+  SRV6_BEHAVIOR_END_B6_ENCAPS = 14;
+  SRV6_BEHAVIOR_END_BM = 15;
+  SRV6_BEHAVIOR_END_DX6 = 16;
+  SRV6_BEHAVIOR_END_DX4 = 17;
+  SRV6_BEHAVIOR_END_DT6 = 18;
+  SRV6_BEHAVIOR_END_DT4 = 19;
+  SRV6_BEHAVIOR_END_DT46 = 20;
+  SRV6_BEHAVIOR_END_DX2 = 21;
+  SRV6_BEHAVIOR_END_DX2V = 22;
+  SRV6_BEHAVIOR_END_DT2U = 23;
+  SRV6_BEHAVIOR_END_DT2M = 24;
+  SRV6_BEHAVIOR_END_B6_ENCAPS_RED = 27;
+  SRV6_BEHAVIOR_END_WITH_USD = 28;
+  SRV6_BEHAVIOR_END_WITH_PSP_USD = 29;
+  SRV6_BEHAVIOR_END_WITH_USP_USD = 30;
+  SRV6_BEHAVIOR_END_WITH_PSP_USP_USD = 31;
+  SRV6_BEHAVIOR_ENDX_WITH_USD = 32;
+  SRV6_BEHAVIOR_ENDX_WITH_PSP_USD = 33;
+  SRV6_BEHAVIOR_ENDX_WITH_USP_USD = 34;
+  SRV6_BEHAVIOR_ENDX_WITH_PSP_USP_USD = 35;
+  SRV6_BEHAVIOR_ENDT_WITH_USD = 36;
+  SRV6_BEHAVIOR_ENDT_WITH_PSP_USD = 37;
+  SRV6_BEHAVIOR_ENDT_WITH_USP_USD = 38;
+  SRV6_BEHAVIOR_ENDT_WITH_PSP_USP_USD = 39;
+  SRV6_BEHAVIOR_ENDM_GTP6D = 69; // 0x0045
+  SRV6_BEHAVIOR_ENDM_GTP6DI = 70; // 0x0046
+  SRV6_BEHAVIOR_ENDM_GTP6E = 71; // 0x0047
+  SRV6_BEHAVIOR_ENDM_GTP4E = 72; // 0x0048
+}
+
+message SRv6EndPointBehavior {
+  SRV6Behavior behavior = 1;
+  uint32 block_len = 2;
+  uint32 node_len = 3;
+  uint32 func_len = 4;
+  uint32 arg_len = 5;
+}
+
+message SRv6BindingSID {
+  bool s_flag = 1;
+  bool i_flag = 2;
+  bool b_flag = 3;
+  bytes sid = 4;
+  SRv6EndPointBehavior endpoint_behavior_structure = 5;
+}
+
+enum ENLPType {
+  ENLP_TYPE_UNSPECIFIED = 0;
+  ENLP_TYPE_TYPE1 = 1;
+  ENLP_TYPE_TYPE2 = 2;
+  ENLP_TYPE_TYPE3 = 3;
+  ENLP_TYPE_TYPE4 = 4;
+}
+
+message TunnelEncapSubTLVSRENLP {
+  uint32 flags = 1;
+  ENLPType enlp = 2;
+}
+
+message SRWeight {
+  uint32 flags = 1;
+  uint32 weight = 2;
+}
+
+message SegmentFlags {
+  bool v_flag = 1;
+  bool a_flag = 2;
+  bool s_flag = 3;
+  bool b_flag = 4;
+}
+
+message SegmentTypeA {
+  SegmentFlags flags = 1;
+  uint32 label = 2;
+}
+
+message SegmentTypeB {
+  SegmentFlags flags = 1;
+  bytes sid = 2;
+  SRv6EndPointBehavior endpoint_behavior_structure = 3;
+}
+
+message TunnelEncapSubTLVSRSegmentList {
+  SRWeight weight = 1;
+
+  message Segment {
+    oneof segment {
+      SegmentTypeA a = 1;
+      SegmentTypeB b = 2;
+    }
+  }
+  repeated Segment segments = 2;
+}
+
+message TunnelEncapSubTLVEgressEndpoint {
+  string address = 1;
+}
+
+message TunnelEncapSubTLVUDPDestPort {
+  uint32 port = 1;
+}
+
+message TunnelEncapSubTLVUnknown {
+  uint32 type = 1;
+  bytes value = 2;
+}
+
+message TunnelEncapTLV {
+  uint32 type = 1;
+  message TLV {
+    oneof tlv {
+      TunnelEncapSubTLVUnknown unknown = 1;
+      TunnelEncapSubTLVEncapsulation encapsulation = 2;
+      TunnelEncapSubTLVProtocol protocol = 3;
+      TunnelEncapSubTLVColor color = 4;
+      TunnelEncapSubTLVEgressEndpoint egress_endpoint = 5;
+      TunnelEncapSubTLVUDPDestPort udp_dest_port = 6;
+      TunnelEncapSubTLVSRPreference sr_preference = 7;
+      TunnelEncapSubTLVSRPriority sr_priority = 8;
+      TunnelEncapSubTLVSRCandidatePathName sr_candidate_path_name = 9;
+      TunnelEncapSubTLVSRENLP sr_enlp = 10;
+      TunnelEncapSubTLVSRBindingSID sr_binding_sid = 11;
+      TunnelEncapSubTLVSRSegmentList sr_segment_list = 12;
+    }
+  }
+  repeated TLV tlvs = 2;
+}
+
+message TunnelEncapAttribute {
+  repeated TunnelEncapTLV tlvs = 1;
+}
+
+message IPv6AddressSpecificExtended {
+  bool is_transitive = 1;
+  uint32 sub_type = 2;
+  string address = 3;
+  uint32 local_admin = 4;
+}
+
+message RedirectIPv6AddressSpecificExtended {
+  string address = 1;
+  uint32 local_admin = 2;
+}
+
+message IP6ExtendedCommunitiesAttribute {
+  message Community {
+    oneof extcom {
+      IPv6AddressSpecificExtended ipv6_address_specific = 1;
+      RedirectIPv6AddressSpecificExtended redirect_ipv6_address_specific = 2;
+      FlowSpecRedirectToIPv6Extended flow_spec_redirect_to_ipv6 = 3;
+    }
+  }
+  repeated Community communities = 1;
+}
+
+message AigpTLVIGPMetric {
+  uint64 metric = 1;
+}
+
+message AigpTLVUnknown {
+  uint32 type = 1;
+  bytes value = 2;
+}
+
+message AigpAttribute {
+  message TLV {
+    oneof tlv {
+      AigpTLVUnknown unknown = 1;
+      AigpTLVIGPMetric igp_metric = 2;
+    }
+  }
+  repeated TLV tlvs = 1;
+}
+
+message LargeCommunity {
+  uint32 global_admin = 1;
+  uint32 local_data1 = 2;
+  uint32 local_data2 = 3;
+}
+
+message LargeCommunitiesAttribute {
+  repeated LargeCommunity communities = 1;
+}
+
+message LsNodeFlags {
+  bool overload = 1;
+  bool attached = 2;
+  bool external = 3;
+  bool abr = 4;
+  bool router = 5;
+  bool v6 = 6;
+}
+
+message LsIGPFlags {
+  bool down = 1;
+  bool no_unicast = 2;
+  bool local_address = 3;
+  bool propagate_nssa = 4;
+}
+
+message LsSrRange {
+  uint32 begin = 1;
+  uint32 end = 2;
+}
+
+message LsSrCapabilities {
+  bool ipv4_supported = 1;
+  bool ipv6_supported = 2;
+  repeated LsSrRange ranges = 3;
+}
+
+message LsSrLocalBlock {
+  repeated LsSrRange ranges = 1;
+}
+
+message LsAttributeNode {
+  string name = 1;
+  LsNodeFlags flags = 2;
+  string local_router_id = 3;
+  string local_router_id_v6 = 4;
+  bytes isis_area = 5;
+  bytes opaque = 6;
+
+  LsSrCapabilities sr_capabilities = 7;
+  bytes sr_algorithms = 8;
+  LsSrLocalBlock sr_local_block = 9;
+
+  // RFC 9351 Section 3 Flexible Algorithm Definition (FAD) TLVs
+  // observed for this Node NLRI. A node MAY advertise more than one
+  // FAD, one per algorithm in the [128, 255] Flex-Algorithm range.
+  repeated LsAttributeFlexAlgoDef flex_algo_defs = 10;
+}
+
+// LsAttributeFlexAlgoDef is the structured projection of a single FAD
+// TLV (TLV 1039, RFC 9351 Section 3). Reserved Metric-Type values
+// (3..127) are passed through verbatim with metric_type_known=false
+// so consumers can render them without guessing semantics.
+message LsAttributeFlexAlgoDef {
+  uint32 algorithm = 1;
+  uint32 metric_type = 2;
+  bool metric_type_known = 3;
+  uint32 calc_type = 4;
+  uint32 priority = 5;
+  repeated uint32 exclude_any_affinity = 6;
+  repeated uint32 include_any_affinity = 7;
+  repeated uint32 include_all_affinity = 8;
+  bytes definition_flags = 9;
+  repeated uint32 exclude_srlg = 10;
+}
+
+message LsAttributeLink {
+  string name = 1;
+  string local_router_id = 2;
+  string local_router_id_v6 = 3;
+  string remote_router_id = 4;
+  string remote_router_id_v6 = 5;
+  uint32 admin_group = 6;
+  uint32 default_te_metric = 7;
+  uint32 igp_metric = 8;
+  bytes opaque = 9;
+
+  float bandwidth = 10;
+  float reservable_bandwidth = 11;
+  repeated float unreserved_bandwidth = 12;
+
+  uint32 sr_adjacency_sid = 13;
+  repeated uint32 srlgs = 14;
+  LsSrv6EndXSID srv6_end_x_sid = 15;
+
+  // RFC 8571 delay/measurement TLVs.
+  bool unidirectional_link_delay_anomalous = 16;
+  uint32 unidirectional_link_delay = 17;
+  bool min_max_unidirectional_link_delay_anomalous = 18;
+  uint32 min_unidirectional_link_delay = 19;
+  uint32 max_unidirectional_link_delay = 20;
+  uint32 unidirectional_delay_variation = 21;
+
+  repeated LsAttributeLinkAdjacencySID sr_adjacency_sids = 22;
+}
+
+message LsAttributeLinkAdjacencySID {
+  uint32 flags = 1;
+  uint32 weight = 2;
+  uint32 sid = 3;
+}
+message LsAttributePrefix {
+  LsIGPFlags igp_flags = 1;
+  bytes opaque = 2;
+
+  // sr_prefix_sid is the SR-MPLS Prefix-SID label when the originator
+  // advertised it with Algorithm = 0 (default SPF). Kept for backward
+  // compatibility with the singular Algorithm-0 lookup callers used
+  // before multi-SID aggregation landed.
+  uint32 sr_prefix_sid = 3;
+
+  // sr_prefix_sids carries every Prefix-SID TLV (RFC 9085
+  // Section 2.1.1) observed on this Prefix NLRI, including the
+  // Algorithm + Flags fields the singular sr_prefix_sid field drops.
+  // Algorithm 0 entries also populate sr_prefix_sid above.
+  repeated LsAttributePrefixSID sr_prefix_sids = 4;
+
+  // fad_prefix_metrics carries every Flexible Algorithm Prefix Metric
+  // TLV (FAPM, TLV 1044, RFC 9351 Section 4) observed on this Prefix
+  // NLRI. One entry per Flex-Algorithm announced.
+  repeated LsAttributeFADPrefixMetric fad_prefix_metrics = 5;
+}
+
+// LsAttributePrefixSID is one Prefix-SID TLV (RFC 9085 Section 2.1.1)
+// projected onto the LsAttribute surface so consumers can read the
+// Algorithm and Flags fields without re-parsing the wire bytes.
+message LsAttributePrefixSID {
+  uint32 algorithm = 1;
+  uint32 flags = 2;
+  uint32 sid = 3;
+}
+
+// LsAttributeFADPrefixMetric is one FAPM TLV (RFC 9351 Section 4)
+// projected onto the LsAttribute surface.
+message LsAttributeFADPrefixMetric {
+  uint32 algorithm = 1;
+  uint32 flags = 2;
+  uint32 metric = 3;
+}
+
+message LsBgpPeerSegmentSIDFlags {
+  bool value = 1;
+  bool local = 2;
+  bool backup = 3;
+  bool persistent = 4;
+}
+
+message LsBgpPeerSegmentSID {
+  LsBgpPeerSegmentSIDFlags flags = 1;
+  uint32 weight = 2;
+  uint32 sid = 3;
+}
+
+message LsAttributeBgpPeerSegment {
+  LsBgpPeerSegmentSID bgp_peer_node_sid = 1;
+  LsBgpPeerSegmentSID bgp_peer_adjacency_sid = 2;
+  LsBgpPeerSegmentSID bgp_peer_set_sid = 3;
+}
+
+message LsSrv6EndXSID {
+  uint32 endpoint_behavior = 1;
+  uint32 flags = 2;
+  uint32 algorithm = 3;
+  uint32 weight = 4;
+  uint32 reserved = 5;
+  repeated string sids = 6;
+  LsSrv6SIDStructure srv6_sid_structure = 7;
+}
+
+message LsSrv6SIDStructure {
+  uint32 local_block = 1;
+  uint32 local_node = 2;
+  uint32 local_func = 3;
+  uint32 local_arg = 4;
+}
+
+message LsSrv6EndpointBehavior {
+  uint32 endpoint_behavior = 1;
+  uint32 flags = 2;
+  uint32 algorithm = 3;
+}
+
+message LsSrv6BgpPeerNodeSID {
+  uint32 flags = 1;
+  uint32 weight = 2;
+  uint32 peer_as = 3;
+  string peer_bgp_id = 4;
+}
+
+message LsAttributeSrv6SID {
+  LsSrv6SIDStructure srv6_sid_structure = 1;
+  LsSrv6EndpointBehavior srv6_endpoint_behavior = 2;
+  LsSrv6BgpPeerNodeSID srv6_bgp_peer_node_sid = 3;
+}
+
+// SR Binding SID TLV (RFC 9857 Section 5.1).
+message LsSrBindingSIDFlags {
+  // D-Flag: the Binding SID is an SRv6 SID (set) or an SR-MPLS label (clear).
+  bool srv6 = 1;
+  // B-Flag: the Binding SID is allocated.
+  bool allocated = 2;
+  // U-Flag: the specified Binding SID is unavailable.
+  bool unavailable = 3;
+  // L-Flag: the Binding SID is allocated from the SRLB.
+  bool from_srlb = 4;
+  // F-Flag: the Binding SID was allocated as a fallback.
+  bool fallback = 5;
+}
+
+message LsSrBindingSID {
+  LsSrBindingSIDFlags flags = 1;
+  // Label and specified_label are used when flags.srv6 is false.
+  uint32 label = 2;
+  uint32 specified_label = 3;
+  // Sid and specified_sid are used when flags.srv6 is true.
+  string sid = 4;
+  string specified_sid = 5;
+}
+
+// SRv6 Binding SID TLV (RFC 9857 Section 5.2).
+message LsSrv6BindingSIDFlags {
+  bool allocated = 1;
+  bool unavailable = 2;
+  bool fallback = 3;
+}
+
+message LsSrv6BindingSID {
+  LsSrv6BindingSIDFlags flags = 1;
+  string sid = 2;
+  string specified_sid = 3;
+  LsSrv6EndpointBehavior endpoint_behavior = 4;
+  LsSrv6SIDStructure sid_structure = 5;
+}
+
+// SR Candidate Path State TLV (RFC 9857 Section 5.3).
+message LsSrCandidatePathStateFlags {
+  bool shutdown = 1;
+  bool active = 2;
+  bool backup = 3;
+  bool evaluated = 4;
+  bool valid_sid_list = 5;
+  bool on_demand = 6;
+  bool delegated = 7;
+  bool provisioned = 8;
+  bool drop_upon_invalid = 9;
+  bool transit_eligible = 10;
+  bool dropping = 11;
+}
+
+message LsSrCandidatePathState {
+  uint32 priority = 1;
+  LsSrCandidatePathStateFlags flags = 2;
+  uint32 preference = 3;
+}
+
+// SR Segment Types (RFC 9857 Section 5.7.1, letters follow RFC 9256).
+enum LsSrSegmentType {
+  LS_SR_SEGMENT_TYPE_UNSPECIFIED = 0;
+  LS_SR_SEGMENT_TYPE_A_MPLS_LABEL = 1;
+  LS_SR_SEGMENT_TYPE_B_SRV6_SID = 2;
+  LS_SR_SEGMENT_TYPE_C_IPV4_NODE = 3;
+  LS_SR_SEGMENT_TYPE_D_IPV6_NODE_MPLS = 4;
+  LS_SR_SEGMENT_TYPE_E_IPV4_NODE_INTERFACE = 5;
+  LS_SR_SEGMENT_TYPE_F_IPV4_ADJACENCY = 6;
+  LS_SR_SEGMENT_TYPE_G_IPV6_NODE_INTERFACE_MPLS = 7;
+  LS_SR_SEGMENT_TYPE_H_IPV6_ADJACENCY_MPLS = 8;
+  LS_SR_SEGMENT_TYPE_I_IPV6_NODE_SRV6 = 9;
+  LS_SR_SEGMENT_TYPE_J_IPV6_NODE_INTERFACE_SRV6 = 10;
+  LS_SR_SEGMENT_TYPE_K_IPV6_ADJACENCY_SRV6 = 11;
+}
+
+message LsSrSegmentFlags {
+  bool sid_present = 1;
+  bool explicit = 2;
+  bool verified = 3;
+  bool resolved = 4;
+  bool algorithm_valid = 5;
+}
+
+// SR Segment sub-TLV (RFC 9857 Section 5.7.1). Which fields are meaningful
+// depends on the segment type:
+// - label: SR-MPLS types (A, C, D, E, F, G, H); sid: SRv6 types (B, I, J, K)
+// - algorithm: A, B, C, D, I
+// - local_address: node address for C, D, E, I; local address for F, G, H, J, K
+// - remote_address: F, G, H, J, K
+// - local_interface_id: E, G, J; remote_interface_id: G, J
+message LsSrSegment {
+  LsSrSegmentType segment_type = 1;
+  LsSrSegmentFlags flags = 2;
+  uint32 label = 3;
+  string sid = 4;
+  uint32 algorithm = 5;
+  string local_address = 6;
+  string remote_address = 7;
+  uint32 local_interface_id = 8;
+  uint32 remote_interface_id = 9;
+  LsSrv6EndpointBehavior endpoint_behavior = 10;
+  LsSrv6SIDStructure sid_structure = 11;
+}
+
+message LsSrSegmentListFlags {
+  bool srv6 = 1;
+  bool explicit = 2;
+  bool computed = 3;
+  bool verified = 4;
+  bool resolved = 5;
+  bool failed = 6;
+  bool all_algorithm = 7;
+  bool all_topology = 8;
+  bool removed_by_fault = 9;
+}
+
+message LsSrSegmentListMetricFlags {
+  bool margin = 1;
+  bool absolute = 2;
+  bool bound = 3;
+  bool value = 4;
+}
+
+// SR Segment List Metric sub-TLV (RFC 9857 Section 5.7.2).
+message LsSrSegmentListMetric {
+  uint32 metric_type = 1;
+  LsSrSegmentListMetricFlags flags = 2;
+  uint32 margin = 3;
+  uint32 bound = 4;
+  uint32 value = 5;
+}
+
+// SR Segment List Bandwidth sub-TLV (RFC 9857 Section 5.7.3), bytes per second.
+message LsSrSegmentListBandwidth {
+  float bandwidth = 1;
+}
+
+// SR Segment List Identifier sub-TLV (RFC 9857 Section 5.7.4).
+message LsSrSegmentListIdentifier {
+  uint32 identifier = 1;
+}
+
+// SR Segment List TLV (RFC 9857 Section 5.7).
+message LsSrSegmentList {
+  LsSrSegmentListFlags flags = 1;
+  uint32 mtid = 2;
+  uint32 algorithm = 3;
+  uint32 weight = 4;
+  repeated LsSrSegment segments = 5;
+  repeated LsSrSegmentListMetric metrics = 6;
+  LsSrSegmentListBandwidth bandwidth = 7;
+  LsSrSegmentListIdentifier identifier = 8;
+}
+
+// Flags of the SR Candidate Path Constraints TLV (RFC 9857 Section 5.6).
+message LsSrCandidatePathConstraintsFlags {
+  // D-Flag: the candidate path uses an SRv6 data plane.
+  bool srv6 = 1;
+  // P-Flag: prefer only protected SIDs.
+  bool protected_only = 2;
+  // U-Flag: prefer only unprotected SIDs.
+  bool unprotected_only = 3;
+  // A-Flag: use only SIDs of the specified algorithm.
+  bool algorithm_only = 4;
+  // T-Flag: use only SIDs of the specified topology.
+  bool topology_only = 5;
+  // S-Flag: P or U is a strict constraint rather than a preference.
+  bool strict = 6;
+  // F-Flag: the path is fixed once computed.
+  bool fixed = 7;
+  // H-Flag: the path uses only hop-by-hop adjacency SIDs.
+  bool hop_by_hop = 8;
+}
+
+// SR Affinity Constraint sub-TLV (RFC 9857 Section 5.6.1). Each Extended
+// Administrative Group is a list of 32-bit words, the first word holding
+// bits 0 to 31.
+message LsSrAffinityConstraint {
+  repeated uint32 exclude_any = 1;
+  repeated uint32 include_any = 2;
+  repeated uint32 include_all = 3;
+}
+
+// SR Bandwidth Constraint sub-TLV (RFC 9857 Section 5.6.3), bytes per second.
+message LsSrBandwidthConstraint {
+  float bandwidth = 1;
+}
+
+message LsSrDisjointGroupRequestFlags {
+  bool srlg = 1;
+  bool node = 2;
+  bool link = 3;
+  bool fallback = 4;
+  bool best_path_fallback = 5;
+}
+
+message LsSrDisjointGroupStatusFlags {
+  bool srlg = 1;
+  bool node = 2;
+  bool link = 3;
+  bool fallback = 4;
+  bool best_path_fallback = 5;
+  bool invalidated = 6;
+}
+
+// SR Disjoint Group Constraint sub-TLV (RFC 9857 Section 5.6.4). The group
+// is identified by group_id, or by pcep_association when the producer
+// encoded a whole PCEP ASSOCIATION Object instead of a 4-octet identifier.
+message LsSrDisjointGroupConstraint {
+  LsSrDisjointGroupRequestFlags request_flags = 1;
+  LsSrDisjointGroupStatusFlags status_flags = 2;
+  uint32 group_id = 3;
+  bytes pcep_association = 4;
+}
+
+message LsSrBidirectionalGroupFlags {
+  // R-Flag: the candidate path forms the reverse path.
+  bool reverse = 1;
+  // C-Flag: the bidirectional path is co-routed.
+  bool co_routed = 2;
+}
+
+// SR Bidirectional Group Constraint sub-TLV (RFC 9857 Section 5.6.5).
+message LsSrBidirectionalGroupConstraint {
+  LsSrBidirectionalGroupFlags flags = 1;
+  uint32 group_id = 2;
+  bytes pcep_association = 3;
+}
+
+message LsSrMetricConstraintFlags {
+  // O-Flag: this is the optimization metric of a dynamic path.
+  bool optimization = 1;
+  // M-Flag: margin is specified.
+  bool margin = 2;
+  // A-Flag: the margin is an absolute value rather than a percentage.
+  bool absolute = 3;
+  // B-Flag: bound is specified.
+  bool bound = 4;
+}
+
+// SR Metric Constraint sub-TLV (RFC 9857 Section 5.6.6).
+message LsSrMetricConstraint {
+  uint32 metric_type = 1;
+  LsSrMetricConstraintFlags flags = 2;
+  uint32 margin = 3;
+  uint32 bound = 4;
+}
+
+// SR Candidate Path Constraints TLV (RFC 9857 Section 5.6).
+message LsSrCandidatePathConstraints {
+  LsSrCandidatePathConstraintsFlags flags = 1;
+  uint32 mtid = 2;
+  uint32 algorithm = 3;
+  LsSrAffinityConstraint affinity = 4;
+  // SR SRLG Constraint sub-TLV (RFC 9857 Section 5.6.2).
+  repeated uint32 srlgs = 5;
+  LsSrBandwidthConstraint bandwidth = 6;
+  LsSrDisjointGroupConstraint disjoint_group = 7;
+  LsSrBidirectionalGroupConstraint bidirectional_group = 8;
+  repeated LsSrMetricConstraint metrics = 9;
+}
+
+// BGP-LS attribute TLVs of an SR Policy Candidate Path NLRI (RFC 9857 Section 5).
+message LsAttributeSrPolicy {
+  LsSrBindingSID binding_sid = 1;
+  repeated LsSrv6BindingSID srv6_binding_sids = 2;
+  LsSrCandidatePathState state = 3;
+  optional string candidate_path_name = 4;
+  optional string policy_name = 5;
+  repeated LsSrSegmentList segment_lists = 6;
+  LsSrCandidatePathConstraints constraints = 7;
+}
+
+message LsAttribute {
+  LsAttributeNode node = 1;
+  LsAttributeLink link = 2;
+  LsAttributePrefix prefix = 3;
+  LsAttributeBgpPeerSegment bgp_peer_segment = 4;
+  LsAttributeSrv6SID srv6_sid = 5;
+  LsAttributeSrPolicy sr_policy = 6;
+}
+
+message UnknownAttribute {
+  uint32 flags = 1;
+  uint32 type = 2;
+  bytes value = 3;
+}
+
+// https://www.rfc-editor.org/rfc/rfc9252.html#section-3.2.1
+message SRv6StructureSubSubTLV {
+  uint32 locator_block_length = 1;
+  uint32 locator_node_length = 2;
+  uint32 function_length = 3;
+  uint32 argument_length = 4;
+  uint32 transposition_length = 5;
+  uint32 transposition_offset = 6;
+}
+
+message SRv6SubSubTLV {
+  oneof tlv {
+    SRv6StructureSubSubTLV structure = 1;
+  }
+}
+
+message SRv6SubSubTLVs {
+  repeated SRv6SubSubTLV tlvs = 1;
+}
+
+message SRv6SIDFlags {
+  // Placeholder for future sid flags
+  bool flag_1 = 1;
+}
+
+// https://tools.ietf.org/html/draft-dawra-bess-srv6-services-02#section-2.1.1
+message SRv6InformationSubTLV {
+  bytes sid = 1;
+  SRv6SIDFlags flags = 2;
+  uint32 endpoint_behavior = 3;
+  map<uint32, SRv6SubSubTLVs> sub_sub_tlvs = 4;
+}
+
+message SRv6SubTLV {
+  oneof tlv {
+    SRv6InformationSubTLV information = 1;
+  }
+}
+
+message SRv6SubTLVs {
+  repeated SRv6SubTLV tlvs = 1;
+}
+
+// https://www.rfc-editor.org/rfc/rfc9252.html#section-2
+message SRv6L3ServiceTLV {
+  map<uint32, SRv6SubTLVs> sub_tlvs = 1;
+}
+
+// https://www.rfc-editor.org/rfc/rfc9252.html#section-2
+message SRv6L2ServiceTLV {
+  map<uint32, SRv6SubTLVs> sub_tlvs = 1;
+}
+
+// https://tools.ietf.org/html/rfc8669
+message PrefixSID {
+  // tlv is one of:
+  message TLV {
+    oneof tlv {
+      // IndexLabelTLV Type 1 (not yet implemented)
+      // OriginatorSRGBTLV Type 3 (not yet implemented)
+      SRv6L3ServiceTLV l3_service = 3;
+      SRv6L2ServiceTLV l2_service = 4;
+    }
+  }
+  repeated TLV tlvs = 1;
+}
