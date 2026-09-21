@@ -1258,6 +1258,23 @@ func (path *Path) MarshalJSON() ([]byte, error) {
 // Return 0 if they are equal
 // Return < 0 if rhs is preferred over the lhs
 func (lhs *Path) Compare(rhs *Path) int {
+	// RFC 9494 4.3 Processing LLGR_STALE Routes: a route carrying the
+	// LLGR_STALE community is deprioritized against any fresh route.
+	// Compare() doubles as the multipath equivalence test (its callers use
+	// Compare(best) == 0 to assemble ECMP groups), so the community has to
+	// be the highest-order tie-break here: a stale path and a fresh path may
+	// otherwise have identical LOCAL_PREF/AS_PATH/ORIGIN/MED and would be
+	// installed as equal next hops, blackholing traffic at the dead egress.
+	// When both paths are stale the comparison falls through, so an all-stale
+	// destination keeps Compare()==0 and preserves the LLGR degraded
+	// forwarding semantics.
+	if s1, s2 := lhs.IsLLGRStale(), rhs.IsLLGRStale(); s1 != s2 {
+		if s1 {
+			return -1
+		}
+		return 1
+	}
+
 	if lhs.IsLocal() && !rhs.IsLocal() {
 		return 1
 	} else if !lhs.IsLocal() && rhs.IsLocal() {
